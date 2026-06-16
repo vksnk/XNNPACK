@@ -169,6 +169,8 @@ bool indexes_pointwise(const slinky::expr& e, const slinky::var& v) {
   return lt != nullptr && slinky::is_constant(lt->a, 1);
 }
 
+// Finds which {`buffer`, `dim`} corresponds to the output dimension variable
+// `v`.
 std::pair<slinky::var, int> find_output_dim(const slinky::func* f,
                                             const slinky::var& v) {
   if (f) {
@@ -272,23 +274,18 @@ void ynn_runtime::schedule() {
     }
   }
 
-  // Maps {buffer_sym, dim_index} to its inferred source region expression.
-  std::map<std::pair<slinky::var, int>, slinky::expr> source_regions;
+  // Maps {buffer_sym, dim_index} to its inferred source region unique
+  // identifier.
+  std::map<std::pair<slinky::var, int>, int> source_regions;
 
-  slinky::node_context source_symbols;
+  int next_source_region_id = 0;
 
-  // Creates a new default symbolic source region variable.
-  auto get_default_source_region = [&](slinky::var buf, int dim) {
-    return slinky::variable::make(source_symbols.insert(
-        "source_" + globals.symbols.name(buf) + "_" + std::to_string(dim)));
-  };
-
-  // Lazily creates a new symbolic source region variable if one doesn't
+  // Lazily creates a new symbolic source region identifier if one doesn't
   // exist.
   auto get_source_region = [&](slinky::var buf, int dim) {
     auto key = std::make_pair(buf, dim);
     if (source_regions.find(key) == source_regions.end()) {
-      source_regions[key] = get_default_source_region(buf, dim);
+      source_regions[key] = next_source_region_id++;
     }
     return source_regions[key];
   };
@@ -350,14 +347,14 @@ void ynn_runtime::schedule() {
           }
         }
 
-        slinky::expr inferred_extent = get_default_source_region(in.sym(), d);
+        int inferred_region = next_source_region_id++;
 
         if (correlated_var.defined()) {
           slinky::var v = correlated_var;
 
           // Collect source regions for this variable from all outputs that
           // contain it.
-          std::vector<slinky::expr> parent_source_regions;
+          std::vector<int> parent_source_regions;
           for (const auto& out : f.outputs()) {
             for (int od = 0; od < out.dims.size(); ++od) {
               if (out.dims[od] == v) {
@@ -373,14 +370,13 @@ void ynn_runtime::schedule() {
             // Check if all parent extents are equivalent.
             bool all_equal = true;
             for (size_t k = 1; k < parent_source_regions.size(); ++k) {
-              if (slinky::as_variable(parent_source_regions[0]) !=
-                  slinky::as_variable(parent_source_regions[k])) {
+              if (parent_source_regions[0] != parent_source_regions[k]) {
                 all_equal = false;
                 break;
               }
             }
             if (all_equal) {
-              inferred_extent = parent_source_regions[0];
+              inferred_region = parent_source_regions[0];
             }
           }
         }
@@ -388,16 +384,13 @@ void ynn_runtime::schedule() {
         auto key = std::make_pair(in.sym(), d);
         if (source_regions.count(key) > 0) {
           // If this buffer has multiple consumers with conflicting inferred
-          // extents, merge them into a new symbol (breaks fusion for this
+          // regions, merge them into a new unique ID (breaks fusion for this
           // dimension).
-          if (slinky::as_variable(source_regions[key]) !=
-              slinky::as_variable(inferred_extent)) {
-            source_regions[key] = slinky::variable::make(source_symbols.insert(
-                "source_" + globals.symbols.name(in.sym()) + "_merged_" +
-                std::to_string(d)));
+          if (source_regions[key] != inferred_region) {
+            source_regions[key] = next_source_region_id++;
           }
         } else {
-          source_regions[key] = inferred_extent;
+          source_regions[key] = inferred_region;
         }
       }
     }
@@ -473,8 +466,10 @@ void ynn_runtime::schedule() {
           // We don't want to fuse a reduction dimension because it is likely
           // being broadcasted here.
           break;
-        }  // Map the consumer's loop variable back to its output dimension
-           // index.
+        }
+        
+        // Map the consumer's loop variable back to its output dimension
+        // index.
         auto [consumer_buf, consumer_dim] =
             find_output_dim(global_loop.loop_id.func, global_loop.loop_id.var);
 
@@ -483,17 +478,16 @@ void ynn_runtime::schedule() {
 
         // Instead of comparing forward extents (which causes false positives
         // for unrelated constant extents), we check if both loops share the
-        // exact same inferred source region symbol.
+        // exact same inferred source region identifier.
         bool extents_match = false;
         if (producer_dim != -1 && consumer_dim != -1 &&
             producer_buf.defined() && consumer_buf.defined()) {
-          slinky::expr producer_source_region =
+          int producer_source_region =
               get_source_region(producer_buf, producer_dim);
-          slinky::expr consumer_source_region =
+          int consumer_source_region =
               get_source_region(consumer_buf, consumer_dim);
 
-          if (slinky::as_variable(producer_source_region) ==
-              slinky::as_variable(consumer_source_region)) {
+          if (producer_source_region == consumer_source_region) {
             extents_match = true;
           }
         }
@@ -748,8 +742,8 @@ ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
 #ifdef YNN_ENABLE_TSL_PROFILER
   if (ynn_traceme_enabled()) {
     if (ynn::perfetto_session::global()) {
-      YNN_LOG_WARNING() <<
-          "tsl::profiler tracing is overriding perfetto tracing.";
+      YNN_LOG_WARNING()
+          << "tsl::profiler tracing is overriding perfetto tracing.";
     }
     eval_config.trace_begin = [](const char* name) {
       return static_cast<slinky::index_t>(
