@@ -192,6 +192,7 @@ cc_test(
     "iota",
     "reduce",
     "reduce_dot",
+    "flash_attention",
     "runtime",
     "split_dim",
     "stack",

@@ -541,9 +541,9 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
     // We enforce this by requiring their step to be equal to their extent.
     sched->loop_splits[0].step_is_required = true;
     sched->loop_splits[2].step_is_required = true;
-    // We split the n into no and ni, so in order to be able to fuse it with
-    // n-loop we trick scheduler into thinking that extent is matching n-extent.
-    sched->loop_splits[3].extent = input.extent(0);
+    // n-loop we provide a scheduler bound matching n-extent loop var (d0).
+    sched->loop_splits[3].scheduler_bound = {runtime.globals.make_dim(0),
+                                             runtime.globals.make_dim(0)};
 
     func.user_data() = sched.get();
     runtime.scheduling_info_storage.push_back(std::move(sched));
@@ -1207,15 +1207,18 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       split_n = {};
     }
 
+    // Schedule the dot in a "fusion-friendly" canonical form: the reduction
+    // (`k`) loops innermost, and every output dim -- including batch dims --
+    // exposed as a loop in natural order (so the outer/batch dims are
+    // outermost). This lets the global scheduler fuse the dot into an adjacent
+    // elementwise/reduction chain (e.g. attention's QK^T -> softmax -> P*V)
+    // purely by matching loops, with no knowledge of its neighbours here: the
+    // non-fusable reduction stays inside, and the pure output dims line up with
+    // a consumer's loops. all_dims is [output dims 0..rank-1] then [reductions].
+    const int rank = output.rank();
     std::vector<int> loop_order;
-    if (output.rank() >= 2) {
-      loop_order = {0, 1};
-      if (pack_b && !packed_b.is_static()) {
-        // Loop over n first so we don't redundantly compute the packing for
-        // each split of m.
-        std::swap(loop_order[0], loop_order[1]);
-      }
-    }
+    for (size_t d = 0; d < num_k_dims; ++d) loop_order.push_back(rank + d);
+    for (int d = 0; d < rank; ++d) loop_order.push_back(d);
 
     // If output is rank >= 2, we want to split n, m, and k. Otherwise, we only
     // split n and k (e.g. fully-connected layers).
@@ -1224,7 +1227,10 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
     if (output.rank() >= 2) {
       splits.push_back(split_m);
       for (size_t i = 2; i < output.rank(); ++i) {
-        splits.push_back({});
+        // Expose batch/outer dims as (per-element) loops so the scheduler can
+        // match them against a consumer's batch loops. For a standalone dot
+        // this just replaces the kernel's internal batch iteration.
+        splits.push_back(slinky::expr(1));
       }
     }
     splits.push_back(split_k);
@@ -1236,7 +1242,10 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
     auto sched = runtime.make_schedule(
         all_dims, all_extents, output.buffer->elem_size(), splits, loop_order);
 
-    // We want to use exactly these loop splits for two innermost dot loops.
+    // Require the step for the two innermost output dims (`n` and `m`, the
+    // microkernel tile). When this dot is fused with another that requires a
+    // different tile for a shared loop, the scheduler reconciles them to their
+    // least common multiple, so both kernels' m/n tiling stays respected.
     for (size_t dim_idx = 0; dim_idx < std::min<size_t>(output_dims.size(), 2);
          ++dim_idx) {
       slinky::var sym = output_dims[dim_idx];
