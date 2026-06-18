@@ -1072,11 +1072,12 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
     std::vector<slinky::var> reduction_dims;
     std::vector<slinky::expr> all_extents;
 
-    for (int i = 0; i < output.rank(); ++i) {
-      all_dims.push_back(output_dims[i]);
-      all_extents.push_back(output.extent(i));
-    }
-
+    // Order all_dims (and the parallel `all_extents`/`splits`) as
+    // [reductions..., n, m, batch...]. This is the loop nest order we want
+    // (reductions innermost, batch outermost), so `loop_order` can stay the
+    // identity (below). Putting the batch dims last also lets make_schedule
+    // auto-compute their splits -- they fall past the end of the `splits` we
+    // provide -- while the reductions and n/m keep their explicit tiles.
     int reduction_dim = 0;
     for (size_t d = 0; d < num_k_dims; ++d) {
       slinky::var r_dim = runtime.globals.make_reduction_dim(reduction_dim);
@@ -1099,6 +1100,11 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       reduction_buffer->dim(reduction_dim).stride = 0;
       reduction_buffer->dim(reduction_dim).fold_factor = slinky::dim::unfolded;
       ++reduction_dim;
+    }
+
+    for (int i = 0; i < output.rank(); ++i) {
+      all_dims.push_back(output_dims[i]);
+      all_extents.push_back(output.extent(i));
     }
 
     // A: We need all of the k dims, i is elementwise.
@@ -1207,45 +1213,42 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       split_n = {};
     }
 
-    // Schedule the dot in a "fusion-friendly" canonical form: the reduction
-    // (`k`) loops innermost, and every output dim -- including batch dims --
-    // exposed as a loop in natural order (so the outer/batch dims are
-    // outermost). This lets the global scheduler fuse the dot into an adjacent
-    // elementwise/reduction chain (e.g. attention's QK^T -> softmax -> P*V)
-    // purely by matching loops, with no knowledge of its neighbours here: the
-    // non-fusable reduction stays inside, and the pure output dims line up with
-    // a consumer's loops. all_dims is [output dims 0..rank-1] then [reductions].
+    // all_dims is already in nesting order [reductions..., n, m, batch...], so
+    // the loop_order is just the identity (make_schedule treats indices past the
+    // end of loop_order as identity, so an empty loop_order means "natural
+    // order"). The only exception: when we pack B, loop over n outside m so we
+    // pack each n block once rather than redundantly per m split -- which is
+    // just swapping the n and m entries (at indices num_k_dims, num_k_dims + 1).
     const int rank = output.rank();
     std::vector<int> loop_order;
-    for (size_t d = 0; d < num_k_dims; ++d) loop_order.push_back(rank + d);
-    for (int d = 0; d < rank; ++d) loop_order.push_back(d);
-
-    // If output is rank >= 2, we want to split n, m, and k. Otherwise, we only
-    // split n and k (e.g. fully-connected layers).
-    std::vector<slinky::expr> splits;
-    splits.push_back(split_n);
-    if (output.rank() >= 2) {
-      splits.push_back(split_m);
-      for (size_t i = 2; i < output.rank(); ++i) {
-        // Expose batch/outer dims as (per-element) loops so the scheduler can
-        // match them against a consumer's batch loops. For a standalone dot
-        // this just replaces the kernel's internal batch iteration.
-        splits.push_back(slinky::expr(1));
-      }
+    if (rank >= 2 && pack_b && !packed_b.is_static()) {
+      loop_order.resize(num_k_dims + 2);
+      for (size_t i = 0; i < loop_order.size(); ++i) loop_order[i] = i;
+      std::swap(loop_order[num_k_dims], loop_order[num_k_dims + 1]);
     }
+
+    // Provide splits only for the reduction dims and n/m (positionally, all_dims
+    // indices [0, num_k_dims + 2)). The batch dims come after these in all_dims
+    // and are intentionally left out: make_schedule auto-computes a cache-aware
+    // tile for them. That still yields a matchable loop, so the dot can fuse
+    // across batch, and when fused the loop adopts the consumer's tile (batch is
+    // not step_is_required); the kernel's `for_each_element` handles whatever
+    // batch tile results.
+    std::vector<slinky::expr> splits;
     splits.push_back(split_k);
     for (size_t i = 1; i < num_k_dims; ++i) {
       // Do not create loops for the remaining k dims.
       splits.push_back({});
     }
+    splits.push_back(split_n);
+    if (output.rank() >= 2) {
+      splits.push_back(split_m);
+    }
 
     auto sched = runtime.make_schedule(
         all_dims, all_extents, output.buffer->elem_size(), splits, loop_order);
 
-    // Require the step for the two innermost output dims (`n` and `m`, the
-    // microkernel tile). When this dot is fused with another that requires a
-    // different tile for a shared loop, the scheduler reconciles them to their
-    // least common multiple, so both kernels' m/n tiling stays respected.
+    // We want to use exactly these loop splits for two innermost dot loops.
     for (size_t dim_idx = 0; dim_idx < std::min<size_t>(output_dims.size(), 2);
          ++dim_idx) {
       slinky::var sym = output_dims[dim_idx];
