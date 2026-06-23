@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -713,6 +714,156 @@ xnn_subgraph_t QD8Attention(size_t batch_size, size_t seq_len, size_t head_dim,
   return subgraph.release();
 }
 
+// Tiled / "flash" attention built entirely from graph primitives (reshape,
+// batch_matmul, reduce, binary, unary). The key reduction axis s is split into
+// B blocks of width w (s = B*w); softmax + the second matmul are computed
+// block-locally (block-local max), then combined across blocks with the
+// flash-attention correction exp(m_b - m). The full [.,t,s] score matrix only
+// ever appears as the transient S/P tensors, so if the scheduler streams the
+// block axis B the working set is bounded by w, not s.
+//
+//   Q=[b,n,t,h]  K=V=[b,n,s,h]  ->  O=[b,n,t,h]
+xnn_subgraph_t FlashAttention(size_t b, size_t t, size_t h, size_t n, size_t s,
+                              size_t w) {
+  if (w == 0 || s % w != 0) {
+    std::cerr << "FlashAttention: S (" << s << ") must be divisible by W (" << w
+              << ")" << std::endl;
+    return nullptr;
+  }
+  const size_t B = s / w;
+
+  auto subgraph = xnnpack::CreateUniqueSubgraph(/*num_external_values=*/4, 0);
+  if (!subgraph) {
+    std::cerr << "failed to create subgraph" << std::endl;
+    return nullptr;
+  }
+
+  bool ok = true;
+  auto def = [&](const std::vector<size_t>& dims, const void* data,
+                 uint32_t ext_id, uint32_t flags) -> uint32_t {
+    uint32_t id = XNN_INVALID_VALUE_ID;
+    if (xnn_define_tensor_value(subgraph.get(), xnn_datatype_fp32, dims.size(),
+                                dims.data(), data, ext_id, flags,
+                                &id) != xnn_status_success) {
+      ok = false;
+    }
+    return id;
+  };
+  auto val = [&](const std::vector<size_t>& dims) {
+    return def(dims, nullptr, XNN_INVALID_VALUE_ID, 0);
+  };
+
+  // External I/O (already in [b, n, seq, h] layout; no projections/transposes).
+  uint32_t Q = def({b, n, t, h}, nullptr, 0, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t K = def({b, n, s, h}, nullptr, 1, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t V = def({b, n, s, h}, nullptr, 2, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t O = def({b, n, t, h}, nullptr, 3, XNN_VALUE_FLAG_EXTERNAL_OUTPUT);
+
+  static std::array<float, XNN_PAD_EXTRA_BYTES(1, float)> scale_data;
+  scale_data[0] = 1.0f / std::sqrt(static_cast<float>(h));
+  uint32_t scale = def({1}, scale_data.data(), XNN_INVALID_VALUE_ID, 0);
+
+  // Internal tensors.
+  uint32_t Qs = val({b, n, t, h});         // scaled query
+  uint32_t Qs5 = val({b, n, 1, t, h});     // + block axis (broadcast over B)
+  uint32_t Kt = val({b, n, B, w, h});      // K reshaped to blocks
+  uint32_t Vt = val({b, n, B, w, h});      // V reshaped to blocks
+  uint32_t Sc = val({b, n, B, t, w});      // per-block scores (TRANSIENT)
+  uint32_t m_b = val({b, n, B, t, 1});     // block-local max
+  uint32_t Sm = val({b, n, B, t, w});      // scores - m_b (TRANSIENT)
+  uint32_t P = val({b, n, B, t, w});       // exp(...) (TRANSIENT, the score block)
+  uint32_t l_b = val({b, n, B, t, 1});     // block partial denom
+  uint32_t U_b = val({b, n, B, t, h});     // block partial output (2nd matmul)
+  uint32_t mm = val({b, n, 1, t, 1});      // global max over blocks
+  uint32_t diff = val({b, n, B, t, 1});    // m_b - m
+  uint32_t c_b = val({b, n, B, t, 1});     // correction exp(m_b - m)
+  uint32_t cl = val({b, n, B, t, 1});      // c_b * l_b
+  uint32_t l = val({b, n, 1, t, 1});       // global denom
+  uint32_t cU = val({b, n, B, t, h});      // c_b * U_b
+  uint32_t num = val({b, n, 1, t, h});     // sum_B(c_b * U_b)
+  uint32_t O5 = val({b, n, 1, t, h});      // num / l
+
+  if (!ok) {
+    std::cerr << "FlashAttention: failed to define tensors" << std::endl;
+    return nullptr;
+  }
+
+  const struct xnn_binary_params clamp = {
+      -std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()};
+  auto check = [&](xnn_status st, const char* what) {
+    if (st != xnn_status_success) {
+      std::cerr << "FlashAttention: failed at " << what << std::endl;
+      ok = false;
+    }
+  };
+
+  std::array<size_t, 5> qs5_shape = {b, n, 1, t, h};
+  std::array<size_t, 5> blk_shape = {b, n, B, w, h};
+  std::array<size_t, 4> o_shape = {b, n, t, h};
+  const size_t axW[] = {4};  // block-width axis
+  const size_t axB[] = {2};  // block axis
+
+  // --- per block (batched over B) ---
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, Q, scale,
+                          Qs, 0),
+        "scale Q");
+  check(xnn_define_static_reshape(subgraph.get(), 5, qs5_shape.data(), Qs, Qs5,
+                                  0),
+        "reshape Q");
+  check(xnn_define_static_reshape(subgraph.get(), 5, blk_shape.data(), K, Kt, 0),
+        "reshape K");
+  check(xnn_define_static_reshape(subgraph.get(), 5, blk_shape.data(), V, Vt, 0),
+        "reshape V");
+  check(xnn_define_batch_matrix_multiply(subgraph.get(), Qs5, Kt, Sc,
+                                         XNN_FLAG_TRANSPOSE_B),
+        "QK^T");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_max, 1, axW, Sc, m_b,
+                                 XNN_FLAG_KEEP_DIMS),
+        "block max");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_subtract, &clamp, Sc, m_b,
+                          Sm, 0),
+        "S - m_b");
+  check(xnn_define_unary(subgraph.get(), xnn_unary_exp, nullptr, Sm, P, 0),
+        "exp");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axW, P, l_b,
+                                 XNN_FLAG_KEEP_DIMS),
+        "block sum");
+  check(xnn_define_batch_matrix_multiply(subgraph.get(), P, Vt, U_b, 0), "P*V");
+
+  // --- combine across blocks ---
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_max, 1, axB, m_b, mm,
+                                 XNN_FLAG_KEEP_DIMS),
+        "global max");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_subtract, &clamp, m_b, mm,
+                          diff, 0),
+        "m_b - m");
+  check(xnn_define_unary(subgraph.get(), xnn_unary_exp, nullptr, diff, c_b, 0),
+        "correction");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, c_b, l_b,
+                          cl, 0),
+        "c_b * l_b");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axB, cl, l,
+                                 XNN_FLAG_KEEP_DIMS),
+        "global sum");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, U_b, c_b,
+                          cU, 0),
+        "c_b * U_b");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axB, cU, num,
+                                 XNN_FLAG_KEEP_DIMS),
+        "combine output");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_divide, &clamp, num, l, O5,
+                          0),
+        "normalize");
+  check(xnn_define_static_reshape(subgraph.get(), 4, o_shape.data(), O5, O, 0),
+        "reshape O");
+
+  if (!ok) {
+    return nullptr;
+  }
+  return subgraph.release();
+}
+
 }  // namespace models
 
 static void FP32Attention(benchmark::State& state) {
@@ -743,12 +894,28 @@ static void QD8Attention(benchmark::State& state) {
   });
 }
 
+static void FlashAttention(benchmark::State& state) {
+  xnnpack::RunBenchmark(state, [&state]() {
+    return models::FlashAttention(FLAGS_batch_size, state.range(0),
+                                  state.range(1), state.range(2),
+                                  state.range(3), state.range(4));
+  });
+}
+
 static void AttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"T", "H", "N", "S"});
   b->Args({64, 64, 32, 64});
   b->Args({256, 64, 32, 256});
   b->Args({1024, 64, 32, 1024});
   b->Args({4096, 64, 32, 4096});
+}
+
+static void FlashAttentionArguments(benchmark::Benchmark* b) {
+  b->ArgNames({"T", "H", "N", "S", "W"});
+  b->Args({1024, 64, 32, 1024, 256});
+  b->Args({4096, 64, 32, 4096, 256});
+  b->Args({4096, 64, 32, 4096, 512});
+  b->Args({4096, 64, 32, 4096, 1024});
 }
 
 BENCHMARK(FP32Attention)
@@ -768,3 +935,9 @@ BENCHMARK(QD8Attention)
     ->MeasureProcessCPUTime()
     ->UseRealTime()
     ->Apply(AttentionArguments);
+
+BENCHMARK(FlashAttention)
+    ->Unit(benchmark::kMicrosecond)
+    ->MeasureProcessCPUTime()
+    ->UseRealTime()
+    ->Apply(FlashAttentionArguments);
