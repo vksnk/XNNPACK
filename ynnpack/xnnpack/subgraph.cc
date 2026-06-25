@@ -19,13 +19,37 @@
 #include "ynnpack/base/log.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/runtime.h"
 #include "ynnpack/xnnpack/dynamic_quantization.h"
 #include "ynnpack/xnnpack/utils.h"
 #include "ynnpack/xnnpack/xnnpack.h"
 
+namespace {
+// Holds the `xnn_allocator` passed to `xnn_initialize` so that the runtime can
+// route its scratch-buffer allocations through it. YNNPACK otherwise allocates
+// working memory directly via `malloc`, which makes a custom allocator's peak
+// tracking (e.g. in benchmarks) report zero. We copy the struct by value
+// because callers may pass a pointer to a temporary.
+xnn_allocator g_xnn_allocator = {};
+
+void* ynn_xnn_aligned_alloc(size_t alignment, size_t size) {
+  return g_xnn_allocator.aligned_allocate(g_xnn_allocator.context, alignment,
+                                          size);
+}
+
+void ynn_xnn_aligned_free(void* ptr) {
+  g_xnn_allocator.aligned_deallocate(g_xnn_allocator.context, ptr);
+}
+}  // namespace
+
 extern "C" {
 
 xnn_status xnn_initialize(const xnn_allocator* allocator) {
+  if (allocator != nullptr && allocator->aligned_allocate != nullptr &&
+      allocator->aligned_deallocate != nullptr) {
+    g_xnn_allocator = *allocator;
+    ynn_set_buffer_allocator(ynn_xnn_aligned_alloc, ynn_xnn_aligned_free);
+  }
   return xnn_status_success;
 }
 

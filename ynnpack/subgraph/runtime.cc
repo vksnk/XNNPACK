@@ -689,7 +689,18 @@ bool ynn_traceme_enabled() {
 }
 #endif
 
+// Optional custom allocator for runtime scratch buffers (see runtime.h). When
+// null, we fall back to slinky's default `malloc`/`free`.
+ynn_buffer_alloc_fn g_buffer_alloc = nullptr;
+ynn_buffer_free_fn g_buffer_free = nullptr;
+
 }  // namespace
+
+void ynn_set_buffer_allocator(ynn_buffer_alloc_fn alloc,
+                              ynn_buffer_free_fn free) {
+  g_buffer_alloc = alloc;
+  g_buffer_free = free;
+}
 
 extern "C" {
 
@@ -697,11 +708,27 @@ ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
                          slinky::thread_pool* threadpool, uint32_t flags)
     : subgraph(subgraph), flags(flags), globals(subgraph->globals) {
   // Implement our required alignment for heap allocations.
-  eval_config.allocate = [](slinky::var sym, slinky::raw_buffer* buffer) {
+  eval_config.allocate = [](slinky::var sym,
+                            slinky::raw_buffer* buffer) -> void* {
+    if (g_buffer_alloc) {
+      // Mirror slinky's `raw_buffer::allocate`, but route the underlying
+      // allocation through the custom hook so it can be tracked.
+      std::optional<std::size_t> size = buffer->init_strides();
+      if (!size) return nullptr;
+      void* allocation = g_buffer_alloc(YNN_ALLOCATION_ALIGNMENT, *size);
+      buffer->base = slinky::align_up(allocation, YNN_ALLOCATION_ALIGNMENT);
+      return allocation;
+    }
     return buffer->allocate(YNN_ALLOCATION_ALIGNMENT);
   };
   eval_config.free = [](slinky::var sym, slinky::raw_buffer* buffer,
-                        void* ptr) { std::free(ptr); };
+                        void* ptr) {
+    if (g_buffer_free) {
+      g_buffer_free(ptr);
+    } else {
+      std::free(ptr);
+    }
+  };
   eval_config.thread_pool = threadpool;
   // Slinky's default check failure handler calls std::abort(), don't let that
   // happen here.

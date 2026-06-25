@@ -7,6 +7,7 @@
 #define XNNPACK_YNNPACK_SUBGRAPH_RUNTIME_H_
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -23,6 +24,19 @@
 #include "slinky/runtime/expr.h"
 #include "slinky/runtime/pipeline.h"
 #include "slinky/runtime/stmt.h"
+
+// Optional custom allocator for the runtime's scratch (working) buffers. When
+// set, runtimes allocate/free their intermediate buffers through these hooks
+// instead of `malloc`/`free`. This lets external code (e.g. benchmarks) observe
+// the runtime's peak working-set memory, which is otherwise invisible because
+// YNNPACK does not route these allocations through `xnn_allocator`. `alloc` must
+// return memory aligned to at least `alignment`. Pass `nullptr`/`nullptr` to
+// restore the default `malloc`/`free` behavior. Not thread-safe: set before
+// creating any runtime.
+using ynn_buffer_alloc_fn = void* (*)(size_t alignment, size_t size);
+using ynn_buffer_free_fn = void (*)(void* ptr);
+void ynn_set_buffer_allocator(ynn_buffer_alloc_fn alloc,
+                              ynn_buffer_free_fn free);
 
 struct ynn_runtime_value : public ynn_value {
   explicit ynn_runtime_value(const ynn_value& value) : ynn_value(value) {}
