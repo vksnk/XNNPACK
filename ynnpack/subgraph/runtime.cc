@@ -1037,13 +1037,32 @@ bool ynn_traceme_enabled() {
 // smaller than this threshold.
 constexpr size_t auto_stack_threshold = 64 * 1024;
 
+// Optional custom allocator for runtime scratch buffers (see runtime.h). When
+// null, we fall back to slinky's default allocator.
+ynn_buffer_alloc_fn g_buffer_alloc = nullptr;
+ynn_buffer_free_fn g_buffer_free = nullptr;
+
 }  // namespace
+
+void ynn_set_buffer_allocator(ynn_buffer_alloc_fn alloc,
+                              ynn_buffer_free_fn free) {
+  g_buffer_alloc = alloc;
+  g_buffer_free = free;
+}
 
 extern "C" {
 
 ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
                          slinky::thread_pool* threadpool, uint32_t flags)
     : subgraph(subgraph), flags(flags), globals(subgraph->globals) {
+  if (g_buffer_alloc) {
+    // Route slinky's heap allocations through the custom hook so they can be
+    // tracked.
+    eval_config.allocate = [](std::size_t size, std::size_t alignment) {
+      return g_buffer_alloc(alignment, size);
+    };
+    eval_config.free = [](void* ptr, std::size_t) { g_buffer_free(ptr); };
+  }
   eval_config.thread_pool = threadpool;
   // Slinky's default check failure handler calls std::abort(), don't let that
   // happen here.
