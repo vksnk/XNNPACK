@@ -226,6 +226,25 @@ cc_test(
 )
 
 cc_test(
+    name = "attention",
+    srcs = ["attention.cc"],
+    args = ["--benchmark_min_time=1x"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":scheduler",
+        ":subgraph_builder",
+        "//ynnpack",
+        "//ynnpack/base",
+        "//ynnpack/base/test:fuzz_test",
+        "//ynnpack/base/test:random",
+        "//ynnpack/base/test:tensor",
+        "@com_google_benchmark//:benchmark",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_test(
     name = "dot_bench",
     srcs = ["dot_bench.cc"],
     args = ["--benchmark_min_time=1x"],

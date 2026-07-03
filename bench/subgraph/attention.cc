@@ -864,6 +864,177 @@ xnn_subgraph_t FlashAttention(size_t b, size_t t, size_t h, size_t n, size_t s,
   return subgraph.release();
 }
 
+// Same flash-attention rfactor as above, but the three per-block partials
+// (m_b, l_b, U_b) are concatenated into a single packed buffer [.., B, t, h+2]
+// and sliced back in pass 2. The packing gives the scheduler a single consumer,
+// which fuses pass 1 into one block loop and bounds the transient score buffers
+// to a single block (O(N) memory).
+xnn_subgraph_t PackedFlashAttention(size_t b, size_t t, size_t h, size_t n,
+                                    size_t s, size_t w) {
+  if (w == 0 || s % w != 0) {
+    std::cerr << "PackedFlashAttention: S (" << s << ") must be divisible by W ("
+              << w << ")" << std::endl;
+    return nullptr;
+  }
+  const size_t B = s / w;
+
+  auto subgraph = xnnpack::CreateUniqueSubgraph(/*num_external_values=*/4, 0);
+  if (!subgraph) {
+    std::cerr << "failed to create subgraph" << std::endl;
+    return nullptr;
+  }
+
+  bool ok = true;
+  auto def = [&](const std::vector<size_t>& dims, const void* data,
+                 uint32_t ext_id, uint32_t flags) -> uint32_t {
+    uint32_t id = XNN_INVALID_VALUE_ID;
+    if (xnn_define_tensor_value(subgraph.get(), xnn_datatype_fp32, dims.size(),
+                                dims.data(), data, ext_id, flags,
+                                &id) != xnn_status_success) {
+      ok = false;
+    }
+    return id;
+  };
+  auto val = [&](const std::vector<size_t>& dims) {
+    return def(dims, nullptr, XNN_INVALID_VALUE_ID, 0);
+  };
+
+  uint32_t Q = def({b, n, t, h}, nullptr, 0, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t K = def({b, n, s, h}, nullptr, 1, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t V = def({b, n, s, h}, nullptr, 2, XNN_VALUE_FLAG_EXTERNAL_INPUT);
+  uint32_t O = def({b, n, t, h}, nullptr, 3, XNN_VALUE_FLAG_EXTERNAL_OUTPUT);
+
+  static std::array<float, XNN_PAD_EXTRA_BYTES(1, float)> scale_data;
+  scale_data[0] = 1.0f / std::sqrt(static_cast<float>(h));
+  uint32_t scale = def({1}, scale_data.data(), XNN_INVALID_VALUE_ID, 0);
+
+  uint32_t Qs = val({b, n, t, h});
+  uint32_t Qs5 = val({b, n, 1, t, h});
+  uint32_t Kt = val({b, n, B, w, h});
+  uint32_t Vt = val({b, n, B, w, h});
+  uint32_t Sc = val({b, n, B, t, w});
+  uint32_t m_b = val({b, n, B, t, 1});
+  uint32_t Sm = val({b, n, B, t, w});
+  uint32_t P = val({b, n, B, t, w});
+  uint32_t l_b = val({b, n, B, t, 1});
+  uint32_t U_b = val({b, n, B, t, h});
+  uint32_t packed = val({b, n, B, t, h + 2});  // [m_b | l_b | U_b]
+  uint32_t m_loc = val({b, n, B, t, 1});
+  uint32_t l_loc = val({b, n, B, t, 1});
+  uint32_t U_loc = val({b, n, B, t, h});
+  uint32_t mm = val({b, n, 1, t, 1});
+  uint32_t diff = val({b, n, B, t, 1});
+  uint32_t c_b = val({b, n, B, t, 1});
+  uint32_t cl = val({b, n, B, t, 1});
+  uint32_t l = val({b, n, 1, t, 1});
+  uint32_t cU = val({b, n, B, t, h});
+  uint32_t num = val({b, n, 1, t, h});
+  uint32_t O5 = val({b, n, 1, t, h});
+
+  if (!ok) {
+    std::cerr << "PackedFlashAttention: failed to define tensors" << std::endl;
+    return nullptr;
+  }
+
+  const struct xnn_binary_params clamp = {
+      -std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()};
+  auto check = [&](xnn_status st, const char* what) {
+    if (st != xnn_status_success) {
+      std::cerr << "PackedFlashAttention: failed at " << what << std::endl;
+      ok = false;
+    }
+  };
+
+  std::array<size_t, 5> qs5_shape = {b, n, 1, t, h};
+  std::array<size_t, 5> blk_shape = {b, n, B, w, h};
+  std::array<size_t, 4> o_shape = {b, n, t, h};
+  const size_t axW[] = {4};
+  const size_t axB[] = {2};
+
+  // --- per block (batched over B) ---
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, Q, scale,
+                          Qs, 0),
+        "scale Q");
+  check(xnn_define_static_reshape(subgraph.get(), 5, qs5_shape.data(), Qs, Qs5, 0),
+        "reshape Q");
+  check(xnn_define_static_reshape(subgraph.get(), 5, blk_shape.data(), K, Kt, 0),
+        "reshape K");
+  check(xnn_define_static_reshape(subgraph.get(), 5, blk_shape.data(), V, Vt, 0),
+        "reshape V");
+  check(xnn_define_batch_matrix_multiply(subgraph.get(), Qs5, Kt, Sc,
+                                         XNN_FLAG_TRANSPOSE_B),
+        "QK^T");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_max, 1, axW, Sc, m_b,
+                                 XNN_FLAG_KEEP_DIMS),
+        "block max");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_subtract, &clamp, Sc, m_b,
+                          Sm, 0),
+        "S - m_b");
+  check(xnn_define_unary(subgraph.get(), xnn_unary_exp, nullptr, Sm, P, 0), "exp");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axW, P, l_b,
+                                 XNN_FLAG_KEEP_DIMS),
+        "block sum");
+  check(xnn_define_batch_matrix_multiply(subgraph.get(), P, Vt, U_b, 0), "P*V");
+
+  // --- pack [m_b | l_b | U_b] along the feature axis ---
+  const uint32_t pack_inputs[] = {m_b, l_b, U_b};
+  check(xnn_define_concatenate(subgraph.get(), /*axis=*/4, /*num_inputs=*/3,
+                               pack_inputs, packed, 0),
+        "pack");
+
+  // --- slice the packed buffer back into views ---
+  const int64_t strides5[] = {1, 1, 1, 1, 1};
+  const int64_t mb_begins[] = {0, 0, 0, 0, 0};
+  const int64_t mb_ends[] = {(int64_t)b, (int64_t)n, (int64_t)B, (int64_t)t, 1};
+  const int64_t lb_begins[] = {0, 0, 0, 0, 1};
+  const int64_t lb_ends[] = {(int64_t)b, (int64_t)n, (int64_t)B, (int64_t)t, 2};
+  const int64_t ub_begins[] = {0, 0, 0, 0, 2};
+  const int64_t ub_ends[] = {(int64_t)b, (int64_t)n, (int64_t)B, (int64_t)t,
+                             (int64_t)(h + 2)};
+  check(xnn_define_static_slice_v3(subgraph.get(), 5, mb_begins, mb_ends,
+                                   strides5, packed, m_loc, 0),
+        "slice m");
+  check(xnn_define_static_slice_v3(subgraph.get(), 5, lb_begins, lb_ends,
+                                   strides5, packed, l_loc, 0),
+        "slice l");
+  check(xnn_define_static_slice_v3(subgraph.get(), 5, ub_begins, ub_ends,
+                                   strides5, packed, U_loc, 0),
+        "slice U");
+
+  // --- combine across blocks ---
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_max, 1, axB, m_loc,
+                                 mm, XNN_FLAG_KEEP_DIMS),
+        "global max");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_subtract, &clamp, m_loc, mm,
+                          diff, 0),
+        "m_b - m");
+  check(xnn_define_unary(subgraph.get(), xnn_unary_exp, nullptr, diff, c_b, 0),
+        "correction");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, c_b, l_loc,
+                          cl, 0),
+        "c_b * l_b");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axB, cl, l,
+                                 XNN_FLAG_KEEP_DIMS),
+        "global sum");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_multiply, &clamp, U_loc, c_b,
+                          cU, 0),
+        "c_b * U_b");
+  check(xnn_define_static_reduce(subgraph.get(), xnn_reduce_sum, 1, axB, cU, num,
+                                 XNN_FLAG_KEEP_DIMS),
+        "combine output");
+  check(xnn_define_binary(subgraph.get(), xnn_binary_divide, &clamp, num, l, O5,
+                          0),
+        "normalize");
+  check(xnn_define_static_reshape(subgraph.get(), 4, o_shape.data(), O5, O, 0),
+        "reshape O");
+
+  if (!ok) {
+    return nullptr;
+  }
+  return subgraph.release();
+}
+
 }  // namespace models
 
 static void FP32Attention(benchmark::State& state) {
@@ -902,6 +1073,14 @@ static void FlashAttention(benchmark::State& state) {
   });
 }
 
+static void PackedFlashAttention(benchmark::State& state) {
+  xnnpack::RunBenchmark(state, [&state]() {
+    return models::PackedFlashAttention(FLAGS_batch_size, state.range(0),
+                                        state.range(1), state.range(2),
+                                        state.range(3), state.range(4));
+  });
+}
+
 static void AttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"T", "H", "N", "S"});
   b->Args({64, 64, 32, 64});
@@ -912,6 +1091,8 @@ static void AttentionArguments(benchmark::Benchmark* b) {
 
 static void FlashAttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"T", "H", "N", "S", "W"});
+  b->Args({64, 64, 32, 64, 64});
+  b->Args({256, 64, 32, 256, 64});
   b->Args({1024, 64, 32, 1024, 256});
   b->Args({4096, 64, 32, 4096, 256});
   b->Args({4096, 64, 32, 4096, 512});
@@ -937,6 +1118,12 @@ BENCHMARK(QD8Attention)
     ->Apply(AttentionArguments);
 
 BENCHMARK(FlashAttention)
+    ->Unit(benchmark::kMicrosecond)
+    ->MeasureProcessCPUTime()
+    ->UseRealTime()
+    ->Apply(FlashAttentionArguments);
+
+BENCHMARK(PackedFlashAttention)
     ->Unit(benchmark::kMicrosecond)
     ->MeasureProcessCPUTime()
     ->UseRealTime()

@@ -39,6 +39,7 @@ bazel_dep(name = "abseil-cpp", version = "20260107.1")
 # builds are using identical dependencies.
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
 
 # LINT.IfChange(googletest)
 # Google Test framework, used by most unit-tests.
@@ -117,11 +118,7 @@ http_archive(
     ],
 )
 
-http_archive(
+local_repository(
     name = "slinky",
-    sha256 = "a9c37be402f2f508cc4626ffcc46f60a4002641915bead4374cd62b64b91ef17",
-    strip_prefix = "slinky-7203ab761bc2e7d744f8b91cfdddab7a1e4ef1a3",
-    urls = [
-        "https://github.com/dsharlet/slinky/archive/7203ab761bc2e7d744f8b91cfdddab7a1e4ef1a3.zip",
-    ],
+    path = "/home/vyyr/Projects/slinky",
 )

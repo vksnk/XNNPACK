@@ -105,6 +105,12 @@ xnnpack_cxx_library(
 )
 
 xnnpack_unit_test(
+    name = "flash_attention_test",
+    srcs = ["flash-attention.cc"],
+    deps = SUBGRAPH_TEST_DEPS,
+)
+
+xnnpack_unit_test(
     name = "unary_test",
     srcs = ["unary.cc"],
     defines = select({
