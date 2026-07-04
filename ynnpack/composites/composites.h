@@ -65,6 +65,30 @@ ynn_status define_reduce_sum(ynn_subgraph_t subgraph, size_t num_axes,
                              uint32_t output_zero_point_id,
                              uint32_t output_scale_id, uint32_t& output_id);
 
+// Scaled dot-product attention:
+//
+//   output = softmax(scale * query @ key^T) @ value
+//
+// `query_id` must be a [b, n, t, h] tensor, `key_id` and `value_id` must be
+// [b, n, s, h] tensors; the output is [b, n, t, h] (b = batch, n = heads,
+// t/s = query/key sequence length, h = head dim). The softmax is computed over
+// the full key sequence, so the transient score tensors are O(t * s) per head.
+ynn_status define_attention(ynn_subgraph_t subgraph, uint32_t query_id,
+                            uint32_t key_id, uint32_t value_id, float scale,
+                            uint32_t& output_id);
+
+// Computes the same operation as `define_attention` using a memory-efficient
+// ("flash attention") two-pass rfactor. The key/value sequence is chopped into
+// blocks of `block_width` (which must divide s); pass 1 computes a block-local
+// softmax and output, packed into a single [b, n, s/w, t, h + 2] tensor; pass 2
+// rescales the blocks by exp(m_block - m_global) and combines them. The packing
+// lets the scheduler fuse pass 1 into one block loop, bounding the transient
+// score tensors to O(t * block_width) per head instead of O(t * s).
+ynn_status define_flash_attention(ynn_subgraph_t subgraph, uint32_t query_id,
+                                  uint32_t key_id, uint32_t value_id,
+                                  float scale, size_t block_width,
+                                  uint32_t& output_id);
+
 // This function computes the quantization parameters of the result of a
 // quantized dot operation. It computes the `zero_point` and `scale` values of
 // the following equivalence:

@@ -12,7 +12,7 @@ cc_library(
     testonly = True,
     srcs = ["scheduler.cc"],
     hdrs = ["scheduler.h"],
-    visibility = ["//ynnpack/subgraph:__subpackages__"],
+    visibility = ["//ynnpack:__subpackages__"],
     deps = [
         "//ynnpack:ynnpack_h",
         "@slinky//slinky/base:thread_pool_impl",
@@ -223,25 +223,6 @@ cc_test(
     linkopts = ynn_binary_linkopts(),
     malloc = ynn_binary_malloc(),
     deps = TEST_DEPS + ["//ynnpack/subgraph"],
-)
-
-cc_test(
-    name = "attention",
-    srcs = ["attention.cc"],
-    args = ["--benchmark_min_time=1x"],
-    linkopts = ynn_binary_linkopts(),
-    malloc = ynn_binary_malloc(),
-    deps = [
-        ":scheduler",
-        ":subgraph_builder",
-        "//ynnpack",
-        "//ynnpack/base",
-        "//ynnpack/base/test:fuzz_test",
-        "//ynnpack/base/test:random",
-        "//ynnpack/base/test:tensor",
-        "@com_google_benchmark//:benchmark",
-        "@com_google_googletest//:gtest",
-    ],
 )
 
 cc_test(
