@@ -145,8 +145,9 @@ void AttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"seq", "head", "heads", "threads"});
   b->UseRealTime();
   b->MeasureProcessCPUTime();
-  // {seq (=t=s), head_dim, num_heads} x thread sweep
-  for (int threads : {1, 8}) {
+  // {seq (=t=s), head_dim, num_heads} x thread sweep. Registering unused
+  // configurations is free; use --benchmark_filter to select what to run.
+  for (int threads : {1, 2, 4, 8, 16, 32}) {
     b->Args({1024, 64, 32, threads});
     b->Args({4096, 64, 32, threads});
   }
