@@ -25,6 +25,10 @@
 #   --threads values outside that set are skipped for the composites.
 # - MODULE.bazel references slinky by absolute path; the machine needs that
 #   checkout (same branch/patches) or an edited path.
+# - Builds are pinned to clang (--cc to override): gcc 16 compiles the ynn
+#   dot microkernels ~1.7x slower than clang 22 (IPC 2.4 vs 3.7), which is
+#   invisible in the graph/IR and once masqueraded as a machine-level
+#   bimodality. The compiler is recorded in the report header.
 
 import argparse
 import json
@@ -61,9 +65,10 @@ def detect_cores():
     return [c[0] for c in cores]
 
 
-def machine_info():
+def machine_info(cc):
     info = {"hostname": sh(["hostname"]).stdout.strip(),
-            "date": datetime.now().isoformat(timespec="seconds")}
+            "date": datetime.now().isoformat(timespec="seconds"),
+            "cc": sh([cc, "--version"]).stdout.splitlines()[0]}
     for line in sh(["lscpu"]).stdout.splitlines():
         for key in ("Model name", "CPU(s)", "Thread(s) per core"):
             if line.startswith(key):
@@ -80,18 +85,20 @@ def machine_info():
     return info
 
 
-def build(stage_dir):
+def build(stage_dir, cc):
+    toolchain = f"--repo_env=CC={cc}"
     targets = [
-        ("xnn_native", ["bazel", "build", "-c", "opt",
+        ("xnn_native", ["bazel", "build", "-c", "opt", toolchain,
                         "//bench/subgraph:attention"],
          "bazel-bin/bench/subgraph/attention"),
         # dynamic_mode=off: the staged copy must not depend on bazel-bin .so
         # runfiles.
-        ("composite", ["bazel", "build", "-c", "opt", "--dynamic_mode=off",
+        ("composite", ["bazel", "build", "-c", "opt", toolchain,
+                       "--dynamic_mode=off",
                        "//ynnpack/composites:attention_benchmark"],
          "bazel-bin/ynnpack/composites/attention_benchmark"),
         # Last: this build overwrites bazel-bin outputs of the first.
-        ("xnn_ynn", ["bazel", "build", "-c", "opt",
+        ("xnn_ynn", ["bazel", "build", "-c", "opt", toolchain,
                      "--define=xnnpack_use_ynnpack=true",
                      "//bench/subgraph:attention"],
          "bazel-bin/bench/subgraph/attention"),
@@ -103,6 +110,9 @@ def build(stage_dir):
         if r.returncode != 0:
             sys.exit(f"build failed: {' '.join(cmd)}")
         dst = stage_dir / name
+        # Staged copies inherit bazel's read-only mode; remove before
+        # overwriting.
+        dst.unlink(missing_ok=True)
         shutil.copy2(output, dst)
         binaries[name] = dst
     return binaries
@@ -172,13 +182,14 @@ def main():
     p.add_argument("--seqs", default="1024,4096")
     p.add_argument("--flash-w", type=int, default=256)
     p.add_argument("--skip-build", action="store_true")
+    p.add_argument("--cc", default="clang")
     p.add_argument("--out", default="attention_matrix_results.json")
     args = p.parse_args()
 
     threads = [int(t) for t in args.threads.split(",")]
     seqs = [int(s) for s in args.seqs.split(",")]
 
-    info = machine_info()
+    info = machine_info(args.cc)
     print("# Attention benchmark matrix")
     for k, v in info.items():
         print(f"#   {k}: {v}")
@@ -196,7 +207,7 @@ def main():
         if missing:
             sys.exit(f"--skip-build but staged binaries missing: {missing}")
     else:
-        binaries = build(stage_dir)
+        binaries = build(stage_dir, args.cc)
 
     def variants(seq, th):
         xnn_filter = f"^FP32Attention/T:{seq}/H:{HEAD_DIM}/N:{NUM_HEADS}/S:{seq}/"
