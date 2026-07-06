@@ -50,6 +50,19 @@ def sh(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
+def fmt_ms(secs):
+    """Formats a duration in ms with ~3 significant digits, so sub-millisecond
+    decode timings don't collapse to '0 ms'."""
+    ms = secs * 1e3
+    if ms < 1:
+        return f"{ms:.3f}"
+    if ms < 10:
+        return f"{ms:.2f}"
+    if ms < 100:
+        return f"{ms:.1f}"
+    return f"{ms:.0f}"
+
+
 def detect_cores():
     """Returns CPU ids sorted by descending max frequency (stable by id)."""
     r = sh(["lscpu", "-e=CPU,MAXMHZ"])
@@ -255,7 +268,7 @@ def main():
                     ghz = r.get("observed_ghz")
                     freq = f", {ghz:.1f} GHz" if ghz else ""
                     print(f"# round {rnd}: {label} seq={seq} {th}T: "
-                          f"{r['seconds']*1e3:.1f} ms, RSS {r['rss_mb']:.0f} MB"
+                          f"{fmt_ms(r['seconds'])} ms, RSS {r['rss_mb']:.0f} MB"
                           f"{freq}", flush=True)
 
     # Markdown tables, one per sequence length.
@@ -279,7 +292,7 @@ def main():
                     row.append("n/a")
                     continue
                 secs = statistics.median(r["seconds"] for r in runs)
-                row.append(f"{secs*1e3:.0f} ms ({flops/secs/1e9:.0f} GF/s)")
+                row.append(f"{fmt_ms(secs)} ms ({flops/secs/1e9:.0f} GF/s)")
             for th in threads:
                 runs = results.get((label, seq, th))
                 row.append(f"{max(r['rss_mb'] for r in runs):.0f} MB"
