@@ -183,6 +183,9 @@ def main():
     p.add_argument("--flash-w", default="256",
                    help="comma-separated flash block widths to run; each must "
                         "be a registered FlashAttention<w> benchmark")
+    p.add_argument("--decode", action="store_true",
+                   help="benchmark the decoding case (query length 1 attending "
+                        "over a --seqs-long KV cache) instead of prefill")
     p.add_argument("--skip-build", action="store_true")
     p.add_argument("--cc", default="clang")
     p.add_argument("--out", default="attention_matrix_results.json")
@@ -212,8 +215,15 @@ def main():
     else:
         binaries = build(stage_dir, args.cc)
 
+    # In decode mode the query length is 1 and --seqs is the KV context
+    # length; the composite benchmarks are the Decode-suffixed variants.
+    t_query = 1 if args.decode else None  # None -> t == s (prefill)
+    vanilla_name = "AttentionDecode" if args.decode else "Attention"
+    flash_prefix = "FlashAttentionDecode" if args.decode else "FlashAttention"
+
     def variants(seq, th):
-        xnn_filter = f"^FP32Attention/T:{seq}/H:{HEAD_DIM}/N:{NUM_HEADS}/S:{seq}/"
+        xnn_t = t_query if args.decode else seq
+        xnn_filter = f"^FP32Attention/T:{xnn_t}/H:{HEAD_DIM}/N:{NUM_HEADS}/S:{seq}/"
         comp = f"seq:{seq}/head:{HEAD_DIM}/heads:{NUM_HEADS}"
         result = [
             ("xnn native vanilla", "xnn_native",
@@ -221,12 +231,12 @@ def main():
             ("xnn+ynnpack vanilla", "xnn_ynn",
              [f"--benchmark_filter={xnn_filter}", f"--num_threads={th}"]),
             ("ynn composite vanilla", "composite",
-             [f"--benchmark_filter=^Attention/{comp}/threads:{th}/"]),
+             [f"--benchmark_filter=^{vanilla_name}/{comp}/threads:{th}/"]),
         ]
         for w in flash_ws:
             result.append(
                 (f"ynn composite flash w{w}", "composite",
-                 [f"--benchmark_filter=^FlashAttention{w}/{comp}/"
+                 [f"--benchmark_filter=^{flash_prefix}{w}/{comp}/"
                   f"threads:{th}/"]))
         return result
 
@@ -251,8 +261,10 @@ def main():
     # Markdown tables, one per sequence length.
     report = []
     for seq in seqs:
-        flops = 4 * NUM_HEADS * seq * seq * HEAD_DIM  # QK^T and P@V
-        report.append(f"\n## seq={seq}, h={HEAD_DIM}, {NUM_HEADS} heads "
+        q_len = 1 if args.decode else seq
+        flops = 4 * NUM_HEADS * q_len * seq * HEAD_DIM  # QK^T and P@V
+        mode = f"decode T=1, S={seq}" if args.decode else f"seq={seq}"
+        report.append(f"\n## {mode}, h={HEAD_DIM}, {NUM_HEADS} heads "
                       f"({flops / 1e9:.1f} GFLOP/invoke)\n")
         header = "| variant | " + " | ".join(
             f"{th}T" for th in threads) + " | " + " | ".join(

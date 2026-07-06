@@ -24,11 +24,17 @@ using threadpool_ptr =
 // Layout: Q, O are [b, n, t, h]; K, V are [b, n, s, h]. `block_width` == 0
 // benchmarks the vanilla `define_attention` composite; otherwise
 // `define_flash_attention`.
-void BenchAttention(benchmark::State& state, size_t b, size_t block_width) {
-  const size_t t = state.range(0);
+//
+// `query_len` == 0 is the prefill / self-attention case (t == s == range(0)).
+// A non-zero `query_len` fixes the query length and takes range(0) as the KV
+// context length s: `query_len` == 1 is the autoregressive decoding case (a
+// single query token attending over the whole KV cache).
+void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
+                    size_t query_len = 0) {
+  const size_t s = state.range(0);
+  const size_t t = query_len == 0 ? s : query_len;
   const size_t h = state.range(1);
   const size_t n = state.range(2);
-  const size_t s = t;
   const int num_threads = static_cast<int>(state.range(3));
   if (block_width != 0 && s % block_width != 0) {
     state.SkipWithError("s must be divisible by the block width");
@@ -152,6 +158,29 @@ void FlashAttention512(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/512);
 }
 
+// Decoding case: a single query token attends over a range(0)-long KV cache.
+// The score slab is 1 x s, so vanilla never materializes a large scores matrix
+// and the workload is dominated by streaming K and V once each (memory-bound).
+void AttentionDecode(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/0, /*query_len=*/1);
+}
+
+void FlashAttentionDecode64(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/64, /*query_len=*/1);
+}
+
+void FlashAttentionDecode128(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/128, /*query_len=*/1);
+}
+
+void FlashAttentionDecode256(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/256, /*query_len=*/1);
+}
+
+void FlashAttentionDecode512(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/512, /*query_len=*/1);
+}
+
 void AttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"seq", "head", "heads", "threads"});
   b->UseRealTime();
@@ -169,6 +198,12 @@ BENCHMARK(FlashAttention64)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention128)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention256)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention512)->Apply(AttentionArguments);
+
+BENCHMARK(AttentionDecode)->Apply(AttentionArguments);
+BENCHMARK(FlashAttentionDecode64)->Apply(AttentionArguments);
+BENCHMARK(FlashAttentionDecode128)->Apply(AttentionArguments);
+BENCHMARK(FlashAttentionDecode256)->Apply(AttentionArguments);
+BENCHMARK(FlashAttentionDecode512)->Apply(AttentionArguments);
 
 }  // namespace
 }  // namespace ynn
