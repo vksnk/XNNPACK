@@ -56,6 +56,18 @@ cc_test(
 )
 
 cc_test(
+    name = "attention_parity_check",
+    srcs = ["attention_parity_check.cc"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":composites",
+        "//:XNNPACK",
+        "//ynnpack",
+    ],
+)
+
+cc_test(
     name = "elementwise_test",
     srcs = ["elementwise_test.cc"],
     linkopts = ynn_binary_linkopts(),

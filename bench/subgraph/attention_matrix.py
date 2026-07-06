@@ -180,7 +180,9 @@ def main():
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--threads", default="1,8")
     p.add_argument("--seqs", default="1024,4096")
-    p.add_argument("--flash-w", type=int, default=256)
+    p.add_argument("--flash-w", default="256",
+                   help="comma-separated flash block widths to run; each must "
+                        "be a registered FlashAttention<w> benchmark")
     p.add_argument("--skip-build", action="store_true")
     p.add_argument("--cc", default="clang")
     p.add_argument("--out", default="attention_matrix_results.json")
@@ -188,6 +190,7 @@ def main():
 
     threads = [int(t) for t in args.threads.split(",")]
     seqs = [int(s) for s in args.seqs.split(",")]
+    flash_ws = [int(w) for w in args.flash_w.split(",")]
 
     info = machine_info(args.cc)
     print("# Attention benchmark matrix")
@@ -212,17 +215,20 @@ def main():
     def variants(seq, th):
         xnn_filter = f"^FP32Attention/T:{seq}/H:{HEAD_DIM}/N:{NUM_HEADS}/S:{seq}/"
         comp = f"seq:{seq}/head:{HEAD_DIM}/heads:{NUM_HEADS}"
-        return [
+        result = [
             ("xnn native vanilla", "xnn_native",
              [f"--benchmark_filter={xnn_filter}", f"--num_threads={th}"]),
             ("xnn+ynnpack vanilla", "xnn_ynn",
              [f"--benchmark_filter={xnn_filter}", f"--num_threads={th}"]),
             ("ynn composite vanilla", "composite",
              [f"--benchmark_filter=^Attention/{comp}/threads:{th}/"]),
-            (f"ynn composite flash w{args.flash_w}", "composite",
-             [f"--benchmark_filter=^FlashAttention{args.flash_w}/{comp}/"
-              f"threads:{th}/"]),
         ]
+        for w in flash_ws:
+            result.append(
+                (f"ynn composite flash w{w}", "composite",
+                 [f"--benchmark_filter=^FlashAttention{w}/{comp}/"
+                  f"threads:{th}/"]))
+        return result
 
     results = {}  # (variant, seq, th) -> list of runs
     for rnd in range(args.rounds):
