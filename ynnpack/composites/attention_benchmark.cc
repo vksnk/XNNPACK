@@ -133,6 +133,17 @@ void Attention(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/0);
 }
 
+// The best block width depends on the L3 size: the softmax chain makes
+// several passes over a seq x block_width score slab per block, so the slab
+// should be a comfortably small fraction of L3.
+void FlashAttention64(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/64);
+}
+
+void FlashAttention128(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/128);
+}
+
 void FlashAttention256(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/256);
 }
@@ -154,6 +165,8 @@ void AttentionArguments(benchmark::Benchmark* b) {
 }
 
 BENCHMARK(Attention)->Apply(AttentionArguments);
+BENCHMARK(FlashAttention64)->Apply(AttentionArguments);
+BENCHMARK(FlashAttention128)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention256)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention512)->Apply(AttentionArguments);
 
