@@ -48,6 +48,7 @@
 #include "slinky/runtime/depends_on.h"
 #include "slinky/runtime/evaluate.h"
 #include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
 #include "slinky/runtime/stmt.h"
 
 void ynn_runtime_value::make_buffer(ynn_runtime& runtime,
@@ -940,6 +941,23 @@ void ynn_runtime::schedule() {
         loops.push_back({dim.var, level.step, level.workers});
       }
 
+      if (getenv("YNN_DUMP_SCHEDULE")) {
+        std::ostringstream os;
+        os << "func " << i
+           << " out=" << globals.symbols.name(f.outputs()[0].sym())
+           << " compute_at=" << compute_at
+           << " loops=[";
+        for (const auto& l : loops) {
+          os << globals.symbols.name(l.var) << ":" << l.step << " ";
+        }
+        os << "] split_extents=[";
+        for (int j = 0; j < loop_splits.size(); ++j) {
+          os << loop_splits[j].extent << " ";
+        }
+        os << "]";
+        std::cout << os.str() << std::endl;
+      }
+
       f.loops(std::move(loops));
     }
   }
@@ -1222,6 +1240,10 @@ ynn_status ynn_runtime::build() {
 
   pipeline = slinky::build_pipeline(globals.symbols, {}, inputs, outputs,
                                     globals.lets, options);
+
+  if (getenv("YNN_DUMP_PIPELINE")) {
+    slinky::print(std::cout, pipeline.body, &globals.symbols);
+  }
 
   slinky::call_stmt::attributes attrs;
   attrs.name = "ynn_reshape_runtime";
