@@ -29,15 +29,6 @@
 #ifdef YNN_ENABLE_TSL_PROFILER
 #include "xla/tsl/profiler/lib/traceme.h"
 #endif
-#include "ynnpack/base/base.h"
-#include "ynnpack/base/log.h"
-#include "ynnpack/base/ref_count.h"
-#include "ynnpack/base/span.h"
-#include "ynnpack/base/type.h"
-#include "ynnpack/include/ynnpack.h"
-#include "ynnpack/subgraph/slinky.h"
-#include "ynnpack/subgraph/subgraph.h"
-#include "ynnpack/subgraph/tensor.h"
 #include "slinky/base/arithmetic.h"
 #include "slinky/base/thread_pool.h"
 #include "slinky/builder/node_mutator.h"
@@ -48,7 +39,17 @@
 #include "slinky/runtime/depends_on.h"
 #include "slinky/runtime/evaluate.h"
 #include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
 #include "slinky/runtime/stmt.h"
+#include "ynnpack/base/base.h"
+#include "ynnpack/base/log.h"
+#include "ynnpack/base/ref_count.h"
+#include "ynnpack/base/span.h"
+#include "ynnpack/base/type.h"
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/slinky.h"
+#include "ynnpack/subgraph/subgraph.h"
+#include "ynnpack/subgraph/tensor.h"
 
 void ynn_runtime_value::make_buffer(ynn_runtime& runtime,
                                     slinky::expr elem_size) {
@@ -129,6 +130,10 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
     if (extents[d].defined() && splits[d].defined()) {
+      // Skip loops with a provably-1 extent: producers whose corresponding
+      // dimension was simplified away can't match them in the scheduler's
+      // fusion walk, which blocks fusion of everything below them.
+      if (slinky::prove_true(extents[d] == 1)) continue;
       loop_splits.push_back({dims[d], splits[d], workers[d], extents[d]});
     }
   }
@@ -607,6 +612,23 @@ void ynn_runtime::schedule() {
         loops.push_back({dim.var, step, dim.workers});
       }
 
+      if (getenv("YNN_DUMP_SCHEDULE")) {
+        std::ostringstream os;
+        os << "func " << i
+           << " out=" << globals.symbols.name(f.outputs()[0].sym())
+           << " compute_at=" << compute_at << " splits_match=" << splits_match
+           << " loops=[";
+        for (const auto& l : loops) {
+          os << globals.symbols.name(l.var) << ":" << l.step << " ";
+        }
+        os << "] split_extents=[";
+        for (int j = 0; j < loop_splits.size(); ++j) {
+          os << loop_splits[j].extent << " ";
+        }
+        os << "]";
+        std::cout << os.str() << std::endl;
+      }
+
       f.loops(std::move(loops));
     }
   }
@@ -904,6 +926,10 @@ ynn_status ynn_runtime::build() {
 
   pipeline = slinky::build_pipeline(globals.symbols, {}, inputs, outputs,
                                     globals.lets, options);
+
+  if (getenv("YNN_DUMP_PIPELINE")) {
+    slinky::print(std::cout, pipeline.body, &globals.symbols);
+  }
 
   slinky::call_stmt::attributes attrs;
   attrs.name = "ynn_reshape_runtime";
