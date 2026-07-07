@@ -205,26 +205,28 @@ void AttentionArguments(benchmark::Benchmark* b) {
   b->MeasureProcessCPUTime();
   // {seq (=t=s), head_dim, num_heads} x thread sweep. Registering unused
   // configurations is free; use --benchmark_filter to select what to run.
-  for (int threads : {1, 2, 4, 8, 16, 32}) {
-    b->Args({1024, 64, 32, threads});
-    b->Args({4096, 64, 32, threads});
+  std::vector<std::vector<int>> shapes = {{512, 64, 8}, {1024, 64, 32}, {4096, 64, 32}};
+  for (const auto& shape : shapes) {
+    for (int threads : {1, 2, 4, 8}) {
+      b->Args({shape[0], shape[1], shape[2], threads});
+    }
   }
 }
 
-BENCHMARK(Attention)->Apply(AttentionArguments);
-BENCHMARK(FlashAttention64)->Apply(AttentionArguments);
-BENCHMARK(FlashAttention128)->Apply(AttentionArguments);
-BENCHMARK(FlashAttention256)->Apply(AttentionArguments);
-BENCHMARK(FlashAttention512)->Apply(AttentionArguments);
+BENCHMARK(Attention)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention64)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention128)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention256)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention512)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 
-BENCHMARK(AttentionTransposed)->Apply(AttentionArguments);
-BENCHMARK(AttentionDecodeTransposed)->Apply(AttentionArguments);
+BENCHMARK(AttentionTransposed)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(AttentionDecodeTransposed)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 
-BENCHMARK(AttentionDecode)->Apply(AttentionArguments);
-BENCHMARK(FlashAttentionDecode64)->Apply(AttentionArguments);
-BENCHMARK(FlashAttentionDecode128)->Apply(AttentionArguments);
-BENCHMARK(FlashAttentionDecode256)->Apply(AttentionArguments);
-BENCHMARK(FlashAttentionDecode512)->Apply(AttentionArguments);
+BENCHMARK(AttentionDecode)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode64)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode128)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode256)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode512)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 
 }  // namespace
 }  // namespace ynn
