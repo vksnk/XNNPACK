@@ -29,8 +29,12 @@ using threadpool_ptr =
 // A non-zero `query_len` fixes the query length and takes range(0) as the KV
 // context length s: `query_len` == 1 is the autoregressive decoding case (a
 // single query token attending over the whole KV cache).
+// When `transpose_io` is set the external tensors are sequence-major
+// (Q/O [b, t, n, h], K/V [b, s, n, h]) and `define_attention` inserts the
+// transposes to head-major, mirroring XNNPACK's layout. Only valid for the
+// vanilla path (block_width == 0).
 void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
-                    size_t query_len = 0) {
+                    size_t query_len = 0, bool transpose_io = false) {
   const size_t s = state.range(0);
   const size_t t = query_len == 0 ? s : query_len;
   const size_t h = state.range(1);
@@ -55,9 +59,10 @@ void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
   }
 
   // Define the external tensors with static shapes: the scheduler and kernel
-  // selection make better decisions when the extents are known.
-  const size_t qo_dims[] = {b, n, t, h};
-  const size_t kv_dims[] = {b, n, s, h};
+  // selection make better decisions when the extents are known. Sequence-major
+  // (b, seq, n, h) when transpose_io, head-major (b, n, seq, h) otherwise.
+  const size_t qo_dims[] = {b, transpose_io ? t : n, transpose_io ? n : t, h};
+  const size_t kv_dims[] = {b, transpose_io ? s : n, transpose_io ? n : s, h};
   uint32_t q_id = 0, k_id = 1, v_id = 2, o_id = 3;
   ynn_define_tensor(subgraph.get(), ynn_type_fp32, 4, qo_dims, nullptr,
                     YNN_VALUE_FLAG_EXTERNAL_INPUT, &q_id);
@@ -70,7 +75,8 @@ void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
 
   ynn_status status;
   if (block_width == 0) {
-    status = define_attention(subgraph.get(), q_id, k_id, v_id, scale, o_id);
+    status = define_attention(subgraph.get(), q_id, k_id, v_id, scale, o_id,
+                              transpose_io);
   } else {
     status = define_flash_attention(subgraph.get(), q_id, k_id, v_id, scale,
                                     block_width, o_id);
@@ -97,13 +103,11 @@ void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
   std::vector<float> v(b * n * s * h, 0.01f);
   std::vector<float> o(b * n * t * h);
 
-  const size_t qo_shape[] = {b, n, t, h};
-  const size_t kv_shape[] = {b, n, s, h};
-  if (ynn_set_external_value_shape(runtime.get(), q_id, 4, qo_shape) !=
+  if (ynn_set_external_value_shape(runtime.get(), q_id, 4, qo_dims) !=
           ynn_status_success ||
-      ynn_set_external_value_shape(runtime.get(), k_id, 4, kv_shape) !=
+      ynn_set_external_value_shape(runtime.get(), k_id, 4, kv_dims) !=
           ynn_status_success ||
-      ynn_set_external_value_shape(runtime.get(), v_id, 4, kv_shape) !=
+      ynn_set_external_value_shape(runtime.get(), v_id, 4, kv_dims) !=
           ynn_status_success ||
       ynn_set_external_value_data(runtime.get(), q_id, q.data()) !=
           ynn_status_success ||
@@ -137,6 +141,20 @@ void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
 
 void Attention(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/0);
+}
+
+// Same as Attention/AttentionDecode but with sequence-major I/O so the
+// composite pays the boundary transposes XNNPACK's attention subgraph pays.
+// A reference point for how much of the composite's edge is the head-major
+// layout assumption vs. the streaming pipeline.
+void AttentionTransposed(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/0, /*query_len=*/0,
+                 /*transpose_io=*/true);
+}
+
+void AttentionDecodeTransposed(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/0, /*query_len=*/1,
+                 /*transpose_io=*/true);
 }
 
 // The best block width depends on the L3 size: the softmax chain makes
@@ -198,6 +216,9 @@ BENCHMARK(FlashAttention64)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention128)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention256)->Apply(AttentionArguments);
 BENCHMARK(FlashAttention512)->Apply(AttentionArguments);
+
+BENCHMARK(AttentionTransposed)->Apply(AttentionArguments);
+BENCHMARK(AttentionDecodeTransposed)->Apply(AttentionArguments);
 
 BENCHMARK(AttentionDecode)->Apply(AttentionArguments);
 BENCHMARK(FlashAttentionDecode64)->Apply(AttentionArguments);

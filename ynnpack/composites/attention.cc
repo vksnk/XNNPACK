@@ -14,27 +14,50 @@ namespace ynn {
 
 ynn_status define_attention(ynn_subgraph_t subgraph, uint32_t query_id,
                             uint32_t key_id, uint32_t value_id, float scale,
-                            uint32_t& output_id) {
+                            uint32_t& output_id, bool transpose_io) {
+  // With sequence-major inputs, swap the sequence and head axes to get the
+  // head-major layout the body below works in: [b, {t|s}, n, h] -> [b, n, ., h].
+  const int32_t io_perm[] = {0, 2, 1, 3};
+  uint32_t q_id = query_id, k_id = key_id, v_id = value_id;
+  if (transpose_io) {
+    q_id = k_id = v_id = YNN_INVALID_VALUE_ID;
+    YNN_RETURN_IF_ERROR(
+        ynn_define_static_transpose(subgraph, 4, io_perm, query_id, &q_id, 0));
+    YNN_RETURN_IF_ERROR(
+        ynn_define_static_transpose(subgraph, 4, io_perm, key_id, &k_id, 0));
+    YNN_RETURN_IF_ERROR(
+        ynn_define_static_transpose(subgraph, 4, io_perm, value_id, &v_id, 0));
+  }
+
   // S = Q @ K^T. `ynn_define_dot` contracts the last axis of `a` with the
   // second-to-last axis of `b`, so K needs its last two axes swapped.
   const int32_t k_t_perm[] = {0, 1, 3, 2};
   uint32_t k_t_id = YNN_INVALID_VALUE_ID;
   YNN_RETURN_IF_ERROR(
-      ynn_define_static_transpose(subgraph, 4, k_t_perm, key_id, &k_t_id, 0));
+      ynn_define_static_transpose(subgraph, 4, k_t_perm, k_id, &k_t_id, 0));
 
   uint32_t scores_id = YNN_INVALID_VALUE_ID;
-  YNN_RETURN_IF_ERROR(ynn_define_dot(subgraph, /*num_k_dims=*/1, query_id,
-                                     k_t_id, YNN_INVALID_VALUE_ID, &scores_id,
-                                     0));
+  YNN_RETURN_IF_ERROR(ynn_define_dot(subgraph, /*num_k_dims=*/1, q_id, k_t_id,
+                                     YNN_INVALID_VALUE_ID, &scores_id, 0));
 
   // P = softmax(scale * S) along the key sequence axis. softmax's `beta`
   // scaling is equivalent to scaling the scores.
   uint32_t probs_id = YNN_INVALID_VALUE_ID;
   YNN_RETURN_IF_ERROR(define_softmax(subgraph, scores_id, scale, probs_id));
 
-  // O = P @ V.
-  return ynn_define_dot(subgraph, /*num_k_dims=*/1, probs_id, value_id,
-                        YNN_INVALID_VALUE_ID, &output_id, 0);
+  // O = P @ V. Head-major; transposed back to sequence-major below if needed.
+  uint32_t o_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_dot(subgraph, /*num_k_dims=*/1, probs_id, v_id,
+                                     YNN_INVALID_VALUE_ID,
+                                     transpose_io ? &o_id : &output_id, 0));
+
+  // Convert the head-major output [b, n, t, h] back to sequence-major
+  // [b, t, n, h].
+  if (transpose_io) {
+    YNN_RETURN_IF_ERROR(
+        ynn_define_static_transpose(subgraph, 4, io_perm, o_id, &output_id, 0));
+  }
+  return ynn_status_success;
 }
 
 ynn_status define_flash_attention(ynn_subgraph_t subgraph, uint32_t query_id,

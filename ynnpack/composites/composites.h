@@ -73,9 +73,17 @@ ynn_status define_reduce_sum(ynn_subgraph_t subgraph, size_t num_axes,
 // [b, n, s, h] tensors; the output is [b, n, t, h] (b = batch, n = heads,
 // t/s = query/key sequence length, h = head dim). The softmax is computed over
 // the full key sequence, so the transient score tensors are O(t * s) per head.
+//
+// If `transpose_io` is true, the inputs and output are instead sequence-major:
+// query/output are [b, t, n, h] and key/value are [b, s, n, h] (the layout an
+// attention block in a transformer typically produces). The function inserts a
+// {0,2,1,3} transpose on each input and on the output to convert to/from the
+// head-major layout above. This mirrors what XNNPACK's attention subgraph does
+// and exists mainly as a fair reference point; head-major callers should leave
+// it false and reorder the KV cache once, out of the hot path.
 ynn_status define_attention(ynn_subgraph_t subgraph, uint32_t query_id,
                             uint32_t key_id, uint32_t value_id, float scale,
-                            uint32_t& output_id);
+                            uint32_t& output_id, bool transpose_io = false);
 
 // Computes the same operation as `define_attention` using a memory-efficient
 // ("flash attention") two-pass rfactor. The key/value sequence is chopped into
