@@ -205,9 +205,9 @@ void AttentionArguments(benchmark::Benchmark* b) {
   b->MeasureProcessCPUTime();
   // {seq (=t=s), head_dim, num_heads} x thread sweep. Registering unused
   // configurations is free; use --benchmark_filter to select what to run.
-  std::vector<std::vector<int>> shapes = {{512, 64, 8}, {1024, 64, 32}, {4096, 64, 32}};
+  std::vector<std::vector<int>> shapes = {{256, 64, 8}, {512, 64, 8}, {1024, 64, 8}, {1024, 64, 32}, {4096, 64, 32}};
   for (const auto& shape : shapes) {
-    for (int threads : {1, 2, 4, 8}) {
+    for (int threads : {1, 2, 4}) {
       b->Args({shape[0], shape[1], shape[2], threads});
     }
   }
