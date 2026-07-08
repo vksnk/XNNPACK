@@ -120,5 +120,5 @@ http_archive(
 
 local_repository(
     name = "slinky",
-    path = "/usr/local/google/home/vksnk/Work/flash/slinky",
+    path = "/home/vyyr/Projects/slinky",
 )
