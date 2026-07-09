@@ -197,6 +197,20 @@ TEST(Attention, MatchesReferenceTransposedIO) {
                            attention, /*transpose_io=*/true);
 }
 
+TEST(AttentionDecode1, MatchesReference) {
+  auto attention_decode1 = [](ynn_subgraph_t subgraph, uint32_t q_id,
+                              uint32_t k_id, uint32_t v_id, float scale,
+                              uint32_t& o_id) {
+    return define_attention_decode1(subgraph, q_id, k_id, v_id, scale, o_id);
+  };
+  VerifyAttentionComposite({/*b=*/1, /*n=*/2, /*t=*/1, /*h=*/16, /*s=*/48},
+                           attention_decode1);
+  VerifyAttentionComposite({/*b=*/2, /*n=*/3, /*t=*/1, /*h=*/64, /*s=*/512},
+                           attention_decode1);
+  VerifyAttentionComposite({/*b=*/1, /*n=*/1, /*t=*/1, /*h=*/8, /*s=*/1},
+                           attention_decode1);
+}
+
 TEST(FlashAttention, MatchesReference) {
   auto flash_with_block_width = [](size_t block_width) {
     return [block_width](ynn_subgraph_t subgraph, uint32_t q_id, uint32_t k_id,

@@ -34,7 +34,8 @@ using threadpool_ptr =
 // transposes to head-major, mirroring XNNPACK's layout. Only valid for the
 // vanilla path (block_width == 0).
 void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
-                    size_t query_len = 0, bool transpose_io = false) {
+                    size_t query_len = 0, bool transpose_io = false,
+                    bool decode1 = false) {
   const size_t s = state.range(0);
   const size_t t = query_len == 0 ? s : query_len;
   const size_t h = state.range(1);
@@ -74,7 +75,10 @@ void BenchAttention(benchmark::State& state, size_t b, size_t block_width,
                     YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &o_id);
 
   ynn_status status;
-  if (block_width == 0) {
+  if (decode1) {
+    status = define_attention_decode1(subgraph.get(), q_id, k_id, v_id, scale,
+                                      o_id);
+  } else if (block_width == 0) {
     status = define_attention(subgraph.get(), q_id, k_id, v_id, scale, o_id,
                               transpose_io);
   } else {
@@ -183,6 +187,15 @@ void AttentionDecode(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/0, /*query_len=*/1);
 }
 
+// Same as AttentionDecode, but keeps K as the dot's `A` operand (natural
+// layout, no transpose/pack) and makes Q the `B` operand instead (a free
+// size-1-axis swap), avoiding the O(s * h) K-transpose/pack that
+// AttentionDecode pays on every decode step. See define_attention_decode1.
+void AttentionDecode1(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*block_width=*/0, /*query_len=*/1,
+                 /*transpose_io=*/false, /*decode1=*/true);
+}
+
 void FlashAttentionDecode64(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*block_width=*/64, /*query_len=*/1);
 }
@@ -223,6 +236,7 @@ BENCHMARK(AttentionTransposed)->Apply(AttentionArguments)->Unit(benchmark::TimeU
 BENCHMARK(AttentionDecodeTransposed)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 
 BENCHMARK(AttentionDecode)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(AttentionDecode1)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(FlashAttentionDecode64)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(FlashAttentionDecode128)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(FlashAttentionDecode256)->Apply(AttentionArguments)->Unit(benchmark::TimeUnit::kMillisecond);
