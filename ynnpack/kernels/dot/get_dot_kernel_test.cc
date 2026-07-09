@@ -121,19 +121,22 @@ TEST(get_dot_kernel, small_n) {
   };
   ASSERT_EQ(fp32_x1(arch_flags_sse2), "dot_fp32_8x4x1_1x4x1_sse2");
   ASSERT_EQ(fp32_x1(arch_flags_avx2), "dot_fp32_8x4x2_1x4x2_avx2");
-  ASSERT_EQ(fp32_x1(arch_flags_avx2_fma3), "dot_fp32_8x4x2_1x4x2_avx2_fma3");
-  ASSERT_EQ(fp32_x1(arch_flags_avx512), "dot_fp32_8x4x4_1x4x4_avx512");
+  // x86_fp32_gemv_m (tile_k=8, no wasted SIMD lanes at small n) beats the
+  // n-vectorized avx2_fma3/avx512 kernels for n <= 4ish; see
+  // ynnpack/kernels/dot/generator/x86_fp32_gemv_m.py.
+  ASSERT_EQ(fp32_x1(arch_flags_avx2_fma3), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
+  ASSERT_EQ(fp32_x1(arch_flags_avx512), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
   ASSERT_EQ(fp32_x2(arch_flags_sse2), "dot_fp32_8x4x1_1x4x1_sse2");
   ASSERT_EQ(fp32_x2(arch_flags_avx2), "dot_fp32_8x4x2_1x4x2_avx2");
-  ASSERT_EQ(fp32_x2(arch_flags_avx2_fma3), "dot_fp32_8x4x2_1x4x2_avx2_fma3");
-  ASSERT_EQ(fp32_x2(arch_flags_avx512), "dot_fp32_8x4x4_1x4x4_avx512");
+  ASSERT_EQ(fp32_x2(arch_flags_avx2_fma3), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
+  ASSERT_EQ(fp32_x2(arch_flags_avx512), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
   ASSERT_EQ(fp32_x3(arch_flags_sse2), "dot_fp32_8x4x1_1x4x1_sse2");
   ASSERT_EQ(fp32_x3(arch_flags_avx2), "dot_fp32_8x4x2_1x4x2_avx2");
-  ASSERT_EQ(fp32_x3(arch_flags_avx2_fma3), "dot_fp32_8x4x2_1x4x2_avx2_fma3");
+  ASSERT_EQ(fp32_x3(arch_flags_avx2_fma3), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
   ASSERT_EQ(fp32_x3(arch_flags_avx512), "dot_fp32_8x4x4_1x4x4_avx512");
   ASSERT_EQ(fp32_x4(arch_flags_sse2), "dot_fp32_8x4x1_1x4x1_sse2");
   ASSERT_EQ(fp32_x4(arch_flags_avx2), "dot_fp32_8x4x2_1x4x2_avx2");
-  ASSERT_EQ(fp32_x4(arch_flags_avx2_fma3), "dot_fp32_8x4x2_1x4x2_avx2_fma3");
+  ASSERT_EQ(fp32_x4(arch_flags_avx2_fma3), "dot_fp32_8x1x8_1x1x8_avx2_fma3");
   ASSERT_EQ(fp32_x4(arch_flags_avx512), "dot_fp32_8x4x4_1x4x4_avx512");
   ASSERT_EQ(fp32_x6(arch_flags_sse2), "dot_fp32_4x8x1_1x4x1_sse2");
   ASSERT_EQ(fp32_x6(arch_flags_avx), "dot_fp32_8x8x1_1x8x1_avx");
