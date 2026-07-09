@@ -45,6 +45,22 @@ cc_library(
     ],
 )
 
+# Attention graph-construction helpers, test/benchmark-only: attention is
+# still under active experimentation (multiple variants, layouts, and
+# decode-specific rewrites), so it's premature to commit to one as a stable,
+# reusable composite in //ynnpack/composites.
+cc_library(
+    name = "attention_graph",
+    testonly = True,
+    srcs = ["attention_graph.cc"],
+    hdrs = ["attention_graph.h"],
+    visibility = ["//ynnpack:__subpackages__"],
+    deps = [
+        "//ynnpack/composites",
+        "//ynnpack:ynnpack_h",
+    ],
+)
+
 cc_test(
     name = "slinky_thread_pool",
     srcs = ["slinky_thread_pool.cc"],
@@ -223,6 +239,45 @@ cc_test(
     linkopts = ynn_binary_linkopts(),
     malloc = ynn_binary_malloc(),
     deps = TEST_DEPS + ["//ynnpack/subgraph"],
+)
+
+cc_test(
+    name = "attention",
+    srcs = ["attention.cc"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = TEST_DEPS + [
+        ":attention_graph",
+        "//ynnpack/composites",
+    ],
+)
+
+cc_test(
+    name = "attention_bench",
+    srcs = ["attention_bench.cc"],
+    args = ["--benchmark_min_time=1x"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":attention_graph",
+        ":scheduler",
+        "//ynnpack",
+        "//ynnpack/base",
+        "//ynnpack/composites",
+    ] + ynn_benchmark_deps(),
+)
+
+cc_test(
+    name = "attention_parity_check",
+    srcs = ["attention_parity_check.cc"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":attention_graph",
+        "//:XNNPACK",
+        "//ynnpack",
+        "//ynnpack/composites",
+    ],
 )
 
 cc_test(

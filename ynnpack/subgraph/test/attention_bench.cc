@@ -9,9 +9,9 @@
 #include <memory>
 #include <vector>
 
-#include "ynnpack/composites/composites.h"
 #include "ynnpack/composites/util.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/test/attention_graph.h"
 #include "ynnpack/subgraph/test/scheduler.h"
 #include <benchmark/benchmark.h>
 
