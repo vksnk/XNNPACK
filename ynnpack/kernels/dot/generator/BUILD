@@ -85,6 +85,7 @@ py_library(
     "x86_bf16_bf16_fp32_k1",
     "x86_fp16_fp16_fp32",
     "x86_fp32",
+    "x86_fp32_gemv_m",
     "x86_fp32_k2",
     "x86_fp32_k4",
     "x86_fp64",

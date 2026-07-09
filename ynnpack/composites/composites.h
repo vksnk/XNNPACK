@@ -85,6 +85,25 @@ ynn_status define_attention(ynn_subgraph_t subgraph, uint32_t query_id,
                             uint32_t key_id, uint32_t value_id, float scale,
                             uint32_t& output_id, bool transpose_io = false);
 
+// Same operation as `define_attention`, specialized for decoding: the caller
+// asserts `t == 1` (a single query token attending over the whole KV cache).
+// `query_id` must be `[b, n, 1, h]`; `key_id`/`value_id` are `[b, n, s, h]` as
+// above. Behavior is undefined if `t != 1`.
+//
+// `define_attention` computes `S = Q @ K^T` by transposing K's last two axes
+// so the (large, O(s * h)) key sequence lands as the dot's contiguous "N"
+// dimension, which then has to be packed for every decode step even though
+// the matmul itself only has 1 row. This version instead keeps K as the dot's
+// `A` operand (its natural [.., s, h] layout already matches `A`'s contract,
+// no transform needed) and makes Q the `B` operand -- Q's own last-two-axes
+// transpose is then over a size-1 dimension, which is a free (aliased,
+// zero-copy) view rather than a real transpose. The `S = K @ Q^T` result
+// lands as `[b, n, s, t]`; a second, equally free, size-1 transpose swaps it
+// back to the `[b, n, t, s]` orientation the rest of the pipeline expects.
+ynn_status define_attention_decode1(ynn_subgraph_t subgraph, uint32_t query_id,
+                                    uint32_t key_id, uint32_t value_id,
+                                    float scale, uint32_t& output_id);
+
 // Computes the same operation as `define_attention` using a memory-efficient
 // ("flash attention") two-pass rfactor. The key/value sequence is chopped into
 // blocks of `block_width` (which must divide s); pass 1 computes a block-local
