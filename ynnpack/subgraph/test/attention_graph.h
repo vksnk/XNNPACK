@@ -50,6 +50,18 @@ ynn_status define_attention_decode1(ynn_subgraph_t subgraph, uint32_t query_id,
                                     float scale, uint32_t& output_id,
                                     bool transpose_io = false);
 
+// Computes the same operation as `define_attention` using a memory-efficient
+// ("flash attention") two-pass rfactor. The key/value sequence is chopped into
+// blocks of `block_width` (which must divide s); pass 1 computes a block-local
+// softmax and output, packed into a single [b, n, s/w, t, h + 2] tensor; pass 2
+// rescales the blocks by exp(m_block - m_global) and combines them. The packing
+// lets the scheduler fuse pass 1 into one block loop, bounding the transient
+// score tensors to O(t * block_width) per head instead of O(t * s).
+ynn_status define_flash_attention(ynn_subgraph_t subgraph, uint32_t query_id,
+                                  uint32_t key_id, uint32_t value_id,
+                                  float scale, size_t block_width,
+                                  uint32_t& output_id);
+
 }  // namespace ynn
 
 #endif  // XNNPACK_YNNPACK_SUBGRAPH_TEST_ATTENTION_GRAPH_H_

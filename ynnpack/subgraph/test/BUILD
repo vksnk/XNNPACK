@@ -298,6 +298,22 @@ cc_test(
 )
 
 cc_test(
+    name = "attention_parity_check",
+    srcs = [
+        "attention_graph.cc",
+        "attention_graph.h",
+        "attention_parity_check.cc",
+    ],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        "//:XNNPACK",
+        "//ynnpack",
+        "//ynnpack/composites",
+    ],
+)
+
+cc_test(
     name = "dot_bench",
     srcs = ["dot_bench.cc"],
     args = ["--benchmark_min_time=1x"],

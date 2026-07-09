@@ -31,8 +31,12 @@ using threadpool_ptr =
 // When `transpose_io` is set the external tensors are sequence-major
 // (Q/O [b, t, n, h], K/V [b, s, n, h]) and `define_attention` inserts the
 // transposes to head-major, mirroring XNNPACK's layout.
+// `block_width` == 0 benchmarks the vanilla `define_attention` composite;
+// otherwise `define_flash_attention` (head-major I/O and the full KV sequence
+// only).
 void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
-                    bool transpose_io = false, bool decode1 = false) {
+                    bool transpose_io = false, bool decode1 = false,
+                    size_t block_width = 0) {
   const bool dynamic = state.range(0);
   const size_t s = state.range(1);
   const size_t t = query_len == 0 ? s : query_len;
@@ -41,6 +45,16 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
   const int num_threads = static_cast<int>(state.range(4));
   const int s_active = std::min<int>(s, static_cast<int>(state.range(5)));
   const float scale = 1.0f / std::sqrt(static_cast<float>(h));
+  if (block_width != 0) {
+    if (transpose_io || decode1 || s_active != s) {
+      state.SkipWithError("unsupported configuration for flash attention");
+      return;
+    }
+    if (s % block_width != 0) {
+      state.SkipWithError("s must be divisible by the block width");
+      return;
+    }
+  }
 
   // The `threads` argument is the total number of threads that should run the
   // work. The runtime's invoking thread participates as a worker, so the
@@ -106,7 +120,11 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
   }
 
   ynn_status status;
-  if (decode1) {
+  if (block_width != 0) {
+    status = define_flash_attention(subgraph.get(), q_id, actual_k_id,
+                                    actual_v_id, scale, block_width,
+                                    actual_o_id);
+  } else if (decode1) {
     status =
         define_attention_decode1(subgraph.get(), q_id, actual_k_id, actual_v_id,
                                  scale, actual_o_id, transpose_io);
@@ -191,6 +209,29 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
 
 void Attention(benchmark::State& state) { BenchAttention(state, /*b=*/1); }
 
+// The best block width depends on the L3 size: the softmax chain makes
+// several passes over a seq x block_width score slab per block, so the slab
+// should be a comfortably small fraction of L3.
+void FlashAttention64(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/0, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/64);
+}
+
+void FlashAttention128(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/0, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/128);
+}
+
+void FlashAttention256(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/0, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/256);
+}
+
+void FlashAttention512(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/0, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/512);
+}
+
 void AttentionTransposed(benchmark::State& state) {
   BenchAttention(state, /*b=*/1, /*query_len=*/0,
                  /*transpose_io=*/true);
@@ -222,6 +263,26 @@ void AttentionDecode1(benchmark::State& state) {
                  /*transpose_io=*/false, /*decode1=*/true);
 }
 
+void FlashAttentionDecode64(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/1, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/64);
+}
+
+void FlashAttentionDecode128(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/1, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/128);
+}
+
+void FlashAttentionDecode256(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/1, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/256);
+}
+
+void FlashAttentionDecode512(benchmark::State& state) {
+  BenchAttention(state, /*b=*/1, /*query_len=*/1, /*transpose_io=*/false,
+                 /*decode1=*/false, /*block_width=*/512);
+}
+
 void AttentionArguments(benchmark::Benchmark* b) {
   b->ArgNames({"dynamic", "seq", "head", "heads", "threads", "seq_active"});
   b->UseRealTime();
@@ -246,6 +307,18 @@ void AttentionArguments(benchmark::Benchmark* b) {
 BENCHMARK(Attention)
     ->Apply(AttentionArguments)
     ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention64)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention128)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention256)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttention512)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(AttentionTransposed)
     ->Apply(AttentionArguments)
     ->Unit(benchmark::TimeUnit::kMillisecond);
@@ -261,6 +334,18 @@ BENCHMARK(AttentionDecode1Transposed)
     ->Apply(AttentionArguments)
     ->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(AttentionDecode1)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode64)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode128)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode256)
+    ->Apply(AttentionArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
+BENCHMARK(FlashAttentionDecode512)
     ->Apply(AttentionArguments)
     ->Unit(benchmark::TimeUnit::kMillisecond);
 
