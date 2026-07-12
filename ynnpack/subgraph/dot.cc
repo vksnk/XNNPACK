@@ -591,6 +591,14 @@ auto make_pack_impl(int elem_count) {
   };
 }
 
+void learn_shape_from_b(dot_shape& shape, size_t num_k_dims,
+                        const ynn_value& b) {
+  shape.n = as_constant(b.extent(0));
+  shape.k1 = as_constant(b.extent(1));
+  shape.k2 = num_k_dims >= 2 ? as_constant(b.extent(2)) : 1;
+  shape.k3 = num_k_dims >= 3 ? as_constant(b.extent(3)) : 1;
+}
+
 // Packing means transposing
 // b(n, k, ...) => b(k%tile_k, n%nr, k/tile_k, n/tile_n, ...)
 // where tile_n is a multiple of the kernel's tile_n, but not greater than the
@@ -611,14 +619,47 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
   slinky::expr k2 = num_k_dims >= 2 ? b.extent(2) : 1;
   slinky::expr k3 = num_k_dims >= 3 ? b.extent(3) : 1;
 
+  slinky::expr tile_k = kernel.tile_k;
+  slinky::expr tile_n = kernel.tile_n;
+  slinky::expr kernel_block_n = kernel.block_n;
+  dot_shape known_shape;
+  learn_shape_from_b(known_shape, num_k_dims, b);
+  if (!known_shape.n && (kernel.flags & dot_flag::transpose_a) == 0) {
+    // The shape of B was not known while building the graph, so `kernel` was
+    // estimated assuming unknown extents are large. That estimate is badly
+    // wrong if n turns out to be 1 (GEMV): a kernel vectorized in k with a
+    // different tile_k is much better there, but the packed layout implied by
+    // the estimated kernel prevents the dot from ever using it. So find the
+    // kernel we'd want for n == 1, and select its layout at reshape time when
+    // n is actually 1. The dot re-selects a kernel compatible with the packed
+    // layout on every call, so it will find the GEMV kernel again. (Kernels
+    // with a transposed A are excluded: the transpose of A is a separate node
+    // whose layout is fixed at graph construction, so we must not change the
+    // packing out from under it.)
+    const uint32_t kernel_flags =
+        consistent_arithmetic ? dot_flag::consistent_arithmetic : 0;
+    dot_shape gemv_shape = known_shape;
+    gemv_shape.n = 1;
+    dot_kernel gemv = get_dot_kernel(type, gemv_shape, /*packed_shape=*/nullptr,
+                                     kernel_flags, /*transpose_a=*/false);
+    if (gemv.kernel && (gemv.flags & dot_flag::transpose_a) == 0 &&
+        gemv.tile_k % element_count == 0 &&
+        (gemv.tile_k != kernel.tile_k || gemv.tile_n != kernel.tile_n)) {
+      slinky::expr is_gemv = n == 1;
+      tile_k = select(is_gemv, gemv.tile_k, kernel.tile_k);
+      tile_n = select(is_gemv, gemv.tile_n, kernel.tile_n);
+      kernel_block_n = select(is_gemv, gemv.block_n, kernel.block_n);
+    }
+  }
+
   const index_t elem_size_bits = type_size_bytes(b.type) * 8 / element_count;
   const index_t cache_elements = cache_size_l2 * 8 / elem_size_bits;
 
   // When choosing block_n, we have the following concerns:
   // - We want to make the block bigger than the kernel's `block_n`
   // - If we want consistent arithmetic: it should be independent of the kernel.
-  const index_t align_block_n =
-      consistent_arithmetic ? consistent_block_n : kernel.block_n;
+  const slinky::expr align_block_n =
+      consistent_arithmetic ? slinky::expr(consistent_block_n) : kernel_block_n;
 
   // - We want to maximize block_n if the block will fit in cache
   slinky::expr cache_blocks_n = slinky::floor_div<slinky::expr>(
@@ -627,17 +668,17 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
 
   // - We don't want the block to be bigger than n (the number of columns of B).
   // - We want it to be aligned to a multiple of the kernel's `tile_n`.
-  block_n = min(slinky::align_up(n, kernel.tile_n), block_n);
+  block_n = min(slinky::align_up(n, tile_n), block_n);
 
   // Make a global variable for the alignment, which is a messy expression,
   // but keep the max outside it, so slinky can learn bounds from it
   // (hacky...).
-  block_n = max(kernel.tile_n, subgraph->globals.get(block_n, "block_n"));
-  slinky::expr tiles_k = slinky::ceil_div<slinky::expr>(k1, kernel.tile_k);
+  block_n = max(tile_n, subgraph->globals.get(block_n, "block_n"));
+  slinky::expr tiles_k = slinky::ceil_div<slinky::expr>(k1, tile_k);
   slinky::expr blocks_n = slinky::ceil_div(n, block_n);
 
   assert(kernel.tile_k % element_count == 0);
-  packed_b.extents = {kernel.tile_k, block_n, tiles_k, blocks_n};
+  packed_b.extents = {tile_k, block_n, tiles_k, blocks_n};
   for (slinky::expr& i : packed_b.extents) {
     i = slinky::simplify(i);
   }
@@ -923,14 +964,6 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
   split_n = runtime.globals.get(split_n, "split_n");
   split_k = runtime.globals.get(split_k, "split_k");
   return {split_n, split_m, split_k};
-}
-
-void learn_shape_from_b(dot_shape& shape, size_t num_k_dims,
-                        const ynn_value& b) {
-  shape.n = as_constant(b.extent(0));
-  shape.k1 = as_constant(b.extent(1));
-  shape.k2 = num_k_dims >= 2 ? as_constant(b.extent(2)) : 1;
-  shape.k3 = num_k_dims >= 3 ? as_constant(b.extent(3)) : 1;
 }
 
 ynn_status always_alias_transpose(ynn_subgraph& subgraph, uint32_t& id) {
