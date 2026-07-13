@@ -143,13 +143,6 @@ TEST_F(LoopFusionTest, PackFusesWithDot) {
 // should be fused into the same loop nest as the pack and the dot, so the
 // intermediate buffer is computed per-block too.
 TEST_F(LoopFusionTest, ProducerOfPackedInputFusesWithDot) {
-  // TODO(vksnk): In this layout exp's n loop is innermost while the dot's
-  // loop nest has n outermost, and the scheduler matches loop splits strictly
-  // positionally, so exp is not fused even though the source regions match.
-  // Remove the skip once the scheduler can match splits by source region
-  // rather than by position.
-  GTEST_SKIP() << "Requires order-insensitive loop split matching.";
-
   const uint32_t a_id = 0;
   const uint32_t b_id = 1;
   const uint32_t out_id = 2;
