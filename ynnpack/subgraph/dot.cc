@@ -691,23 +691,25 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
                                    {std::move(func_input)},
                                    {{output.buffer, dims}}, std::move(attrs));
 
-    auto sched = std::make_unique<scheduling_info>();
+    // Pin ki, ni and ko to their full extents (the packing kernel produces
+    // whole ki x ni tiles and all of ko at once), and let make_schedule pick
+    // splits and workers for the blocks_n and batch dimensions, so the
+    // packing is parallelized even when it is not fused into a dot's loop
+    // nest (e.g. when it is constant folded). When it is fused, the splits
+    // don't require their steps, so they adopt the loops of the dot as
+    // before.
+    std::vector<slinky::expr> given_splits = {output.physical_extent(0),
+                                              output.physical_extent(1),
+                                              output.physical_extent(2)};
+    auto sched =
+        runtime.make_schedule(dims, output.physical_extents(),
+                              output.buffer->elem_size(), given_splits);
 
     // TODO(vksnk): This is a temporary workaround to avoid recomputing packed
     // buffer. The proper fix would probably involve adding a loop splits for
     // the packing function and making scheduler match it.
     if (num_k_dims > 1) {
       sched->force_root = true;
-    }
-    // Use "identity" splits where step == extent which will always fuse into
-    // parent loop as long as extents match.
-    // TODO(vksnk): Ideally we should select better steps, so the packing is
-    // parallelized even if it's not fused.
-    for (int i = 0; i < output.extents.size(); i++) {
-      sched->loop_splits.push_back({dims[i], output.physical_extent(i),
-                                    slinky::loop::serial,
-                                    output.physical_extent(i),
-                                    /*step_is_required=*/false});
     }
     // ki (dim 0) and ko (dim 2) must not be split.
     // We enforce this by requiring their step to be equal to their extent.

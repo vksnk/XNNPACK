@@ -31,8 +31,9 @@ int TestScheduler::num_threads_impl(void* self) {
 
 void TestScheduler::schedule_impl(void* self, void* context,
                                   void (*task)(void* context)) {
-  reinterpret_cast<TestScheduler*>(self)->impl_.enqueue(
-      [task, context]() { (*task)(context); });
+  TestScheduler* scheduler = reinterpret_cast<TestScheduler*>(self);
+  ++scheduler->task_count_;
+  scheduler->impl_.enqueue([task, context]() { (*task)(context); });
 }
 
 const ynn_scheduler* TestScheduler::scheduler() {
