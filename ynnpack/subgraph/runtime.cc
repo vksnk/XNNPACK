@@ -223,8 +223,7 @@ std::map<std::pair<slinky::var, int>, int> infer_source_regions(
       }
     }
 
-    const auto* sched =
-        static_cast<const ynn::scheduling_info*>(f.user_data());
+    const auto* sched = static_cast<const ynn::scheduling_info*>(f.user_data());
 
     for (size_t in_idx = 0; in_idx < f.inputs().size(); ++in_idx) {
       const auto& in = f.inputs()[in_idx];
@@ -232,6 +231,7 @@ std::map<std::pair<slinky::var, int>, int> infer_source_regions(
       if (sched && in_idx < sched->input_scheduler_bounds.size()) {
         scheduler_bounds = &sched->input_scheduler_bounds[in_idx];
       }
+
       for (int d = 0; d < in.bounds.size(); ++d) {
         slinky::interval_expr bound = in.bounds[d];
 

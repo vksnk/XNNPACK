@@ -168,8 +168,7 @@ struct scheduling_info {
   // layout (e.g. dot reading blocks_n of a packed buffer, or pack_b reading
   // blocks of its source) declare an input dimension as a virtual 1-to-1
   // mapping with one of its loop variables, so producers of that input can be
-  // fused with loops derived from it even though the real bounds are scaled by
-  // a block size.
+  // fused with loops derived from it.
   std::vector<std::vector<slinky::interval_expr>> input_scheduler_bounds;
 
   bool force_root = false;

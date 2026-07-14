@@ -394,6 +394,22 @@ bool rewrite_convert_elementwise(ynn_subgraph& subgraph, ynn_node& node,
                     << to_string(binary->op) << "(a, b)";
     ynn::define_binary(subgraph, node, a.id, b.id, x.id, binary->op, kernel);
     return true;
+  } else if (const auto* ternary =
+                 std::get_if<ynn_node::ternary_elementwise>(&producer->op)) {
+    const ynn_value& a = subgraph.value(producer->inputs[0]);
+    const ynn_value& b = subgraph.value(producer->inputs[1]);
+    const ynn_value& c = subgraph.value(producer->inputs[2]);
+    const ynn_value& x = subgraph.value(node.outputs[0]);
+
+    ynn::ternary_kernel_fn kernel =
+        ynn::get_ternary_kernel(ternary->op, a.type, b.type, c.type, x.type);
+    if (!kernel) return false;
+    YNN_LOG_DEBUG() << "Rewriting "
+                    << "convert(" << to_string(ternary->op) << "(a, b, c)) to "
+                    << to_string(ternary->op) << "(a, b, c)";
+    ynn::define_ternary(subgraph, node, a.id, b.id, c.id, x.id, ternary->op,
+                        kernel);
+    return true;
   }
   return false;
 }
@@ -1265,6 +1281,73 @@ bool rewrite_dequantize_dot_convert(ynn_subgraph& subgraph, ynn_node& node,
   return true;
 }
 
+// Rewrite ternary(convert(x), ...) to ternary(x, ...) if a kernel exists for
+// the input types.
+bool rewrite_ternary_convert(ynn_subgraph& subgraph, ynn_node& node,
+                             subgraph_analysis& analysis) {
+  const ynn_node::ternary_elementwise* ternary =
+      std::get_if<ynn_node::ternary_elementwise>(&node.op);
+  if (!ternary) return false;
+
+  ynn_node* producers[3] = {analysis.producer_of(node.inputs[0]),
+                            analysis.producer_of(node.inputs[1]),
+                            analysis.producer_of(node.inputs[2])};
+  bool is_convert[3] = {
+      producers[0] && is_unary_node(*producers[0], ynn_unary_convert),
+      producers[1] && is_unary_node(*producers[1], ynn_unary_convert),
+      producers[2] && is_unary_node(*producers[2], ynn_unary_convert)};
+
+  if (!is_convert[0] && !is_convert[1] && !is_convert[2]) {
+    return false;
+  }
+
+  uint32_t input_ids[3] = {
+      is_convert[0] ? producers[0]->inputs[0] : node.inputs[0],
+      is_convert[1] ? producers[1]->inputs[0] : node.inputs[1],
+      is_convert[2] ? producers[2]->inputs[0] : node.inputs[2]};
+
+  const ynn_value& a = subgraph.value(input_ids[0]);
+  const ynn_value& b = subgraph.value(input_ids[1]);
+  const ynn_value& c = subgraph.value(input_ids[2]);
+  const ynn_value& output = subgraph.value(node.outputs[0]);
+
+  // Try rewriting all converts.
+  ynn::ternary_kernel_fn kernel =
+      ynn::get_ternary_kernel(ternary->op, a.type, b.type, c.type, output.type);
+  if (kernel != nullptr) {
+    YNN_LOG_DEBUG() << "Rewriting " << to_string(ternary->op)
+                    << "(convert(x), ...) to " << to_string(ternary->op)
+                    << "(x, ...)";
+    ynn::define_ternary(subgraph, node, a.id, b.id, c.id, output.id,
+                        ternary->op, kernel);
+    return true;
+  }
+
+  // Try rewriting individual convert inputs.
+  for (int i = 0; i < 3; ++i) {
+    if (!is_convert[i]) continue;
+    uint32_t test_ids[3] = {node.inputs[0], node.inputs[1], node.inputs[2]};
+    test_ids[i] = producers[i]->inputs[0];
+
+    const ynn_value& ta = subgraph.value(test_ids[0]);
+    const ynn_value& tb = subgraph.value(test_ids[1]);
+    const ynn_value& tc = subgraph.value(test_ids[2]);
+
+    kernel = ynn::get_ternary_kernel(ternary->op, ta.type, tb.type, tc.type,
+                                      output.type);
+    if (kernel != nullptr) {
+      YNN_LOG_DEBUG() << "Rewriting " << to_string(ternary->op)
+                      << "(convert(x), ...) to " << to_string(ternary->op)
+                      << "(x, ...)";
+      ynn::define_ternary(subgraph, node, ta.id, tb.id, tc.id, output.id,
+                          ternary->op, kernel);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 // Rewrite f(x * C) to fold the arithmetic into the params.
 bool fold_unary_input(ynn_subgraph& subgraph, ynn_node& node,
                       subgraph_analysis& analysis) {
@@ -2019,6 +2102,55 @@ bool rewrite_fast_math(ynn_subgraph& subgraph, ynn_node& node,
   return false;
 }
 
+// Rewrite requantize_to_uint8(quantize_int8(x, scale, zp)) to
+// quantize_uint8(x, scale, zp + 128)
+bool rewrite_requantize_quantize(ynn_subgraph& subgraph, ynn_node& node,
+                                 subgraph_analysis& analysis) {
+  if (!is_unary_node(node, ynn_unary_requantize_to_uint8)) {
+    return false;
+  }
+
+  ynn_node* producer = analysis.producer_of(node.inputs[0]);
+  if (!producer || !is_ternary_node(*producer, ternary_op::quantize_int8)) {
+    return false;
+  }
+
+  uint32_t input_id = producer->inputs[0];
+  uint32_t scale_id = producer->inputs[1];
+  uint32_t zp_id = producer->inputs[2];
+
+  const ynn_value& zp_val = subgraph.value(zp_id);
+  if (!zp_val.is_static_scalar()) {
+    return false;
+  }
+  std::optional<ynn::real> zp_scalar = zp_val.as_scalar();
+  if (!zp_scalar) {
+    return false;
+  }
+  int32_t new_zp_val = static_cast<int32_t>(*zp_scalar) + 128;
+  uint32_t new_zp_id = subgraph.get_scalar_value_id(
+      ynn_type_int32, static_cast<float>(new_zp_val));
+
+  uint32_t output_id = node.outputs[0];
+
+  const ynn_value& input = subgraph.value(input_id);
+  const ynn_value& output = subgraph.value(output_id);
+
+  const ynn::ternary_kernel_fn kernel =
+      ynn::get_ternary_kernel(ternary_op::quantize_uint8, input.type,
+                              ynn_type_fp32, ynn_type_int32, output.type);
+  if (!kernel) {
+    return false;
+  }
+
+  // Redefine node as quantize_uint8
+  ynn::define_ternary(subgraph, node, input_id, scale_id, new_zp_id, output_id,
+                      ternary_op::quantize_uint8, kernel);
+
+  analysis.invalidate();
+  return true;
+}
+
 }  // namespace
 
 }  // namespace ynn
@@ -2044,6 +2176,7 @@ ynn_status ynn_subgraph::fusion() {
                 ynn::rewrite_sum_to_dot(*this, node, analysis) ||
                 ynn::rewrite_ternary(*this, node, analysis) ||
                 ynn::rewrite_binary_convert(*this, node, analysis) ||
+                ynn::rewrite_ternary_convert(*this, node, analysis) ||
                 ynn::rewrite_convert_elementwise(*this, node, analysis) ||
                 ynn::rewrite_negate_multiply(*this, node, analysis) ||
                 ynn::rewrite_dequantize_dot(*this, node, analysis) ||
@@ -2059,7 +2192,9 @@ ynn_status ynn_subgraph::fusion() {
                 ynn::rewrite_reduce_sum_of_squared(*this, node, analysis) ||
                 ynn::rewrite_reduce_convert(*this, node, analysis) ||
                 ynn::rewrite_reduce_static_transpose(*this, node, analysis) ||
-                ynn::rewrite_fast_math(*this, node, analysis) || false;
+                ynn::rewrite_fast_math(*this, node, analysis) ||
+                ynn::rewrite_requantize_quantize(*this, node, analysis) ||
+                false;
 
       if (!analysis.is_valid) {
         break;

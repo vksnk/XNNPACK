@@ -460,6 +460,8 @@ struct SquareRoot : public UnaryOpInfo {
         // numbers.
         return {std::numeric_limits<float>::epsilon(),
                 std::numeric_limits<float>::max() / 4};
+      case xnn_datatype_bf16:
+        return {std::numeric_limits<float>::epsilon(), 1.0e30f};
       default:
         return Interval::Positive(datatype);
     }

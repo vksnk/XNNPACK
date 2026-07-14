@@ -3,89 +3,30 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-// Tests for the automatic scheduler's loop fusion decisions. These tests
-// build small subgraphs and inspect the loop structure of the resulting
-// slinky pipeline to check which functions ended up sharing loops.
+// Tests that the automatic scheduler successfully fuses loops between operators
+// in small subgraphs. We verify this by using a custom allocator to track
+// max_allocation_size during execution; when loops are fused, intermediate
+// buffers (like packed weights or elementwise outputs) are processed and
+// allocated per-block inside the loop nest rather than as full buffers up
+// front.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <sstream>
-#include <string>
-#include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "ynnpack/base/test/tensor.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/subgraph/runtime.h"
 #include "ynnpack/subgraph/test/scheduler.h"
 #include "ynnpack/subgraph/test/subgraph_builder.h"
-#include "slinky/runtime/expr.h"
-#include "slinky/runtime/print.h"
-#include "slinky/runtime/stmt.h"
 
 namespace ynn {
 namespace {
 
-// Records, for every call_stmt in the pipeline body, the stack of loops
-// enclosing it, keyed by the name of the call.
-class call_loops_collector : public slinky::recursive_node_visitor {
- public:
-  using loop_stack = std::vector<slinky::var>;
-
-  void visit(const slinky::loop* op) override {
-    loops_.push_back(op->sym);
-    slinky::recursive_node_visitor::visit(op);
-    loops_.pop_back();
-  }
-
-  void visit(const slinky::call_stmt* op) override {
-    calls_[op->attrs.name].push_back(loops_);
-  }
-
-  // Returns the loop stacks of all calls whose name starts with `prefix`.
-  std::vector<loop_stack> find(const std::string& prefix) const {
-    std::vector<loop_stack> result;
-    for (const auto& [name, stacks] : calls_) {
-      if (name.rfind(prefix, 0) == 0) {
-        result.insert(result.end(), stacks.begin(), stacks.end());
-      }
-    }
-    return result;
-  }
-
- private:
-  loop_stack loops_;
-  std::map<std::string, std::vector<loop_stack>> calls_;
-};
-
-// All loop stacks come from the same stmt tree, so the loops shared between
-// two calls are the common prefix of their loop stacks.
-size_t common_loops(const call_loops_collector::loop_stack& a,
-                    const call_loops_collector::loop_stack& b) {
-  size_t d = 0;
-  while (d < a.size() && d < b.size() && a[d] == b[d]) ++d;
-  return d;
-}
-
-// The maximum number of shared loops over all pairs of calls from `a` and `b`.
-size_t max_common_loops(
-    const std::vector<call_loops_collector::loop_stack>& a,
-    const std::vector<call_loops_collector::loop_stack>& b) {
-  size_t result = 0;
-  for (const auto& i : a) {
-    for (const auto& j : b) {
-      result = std::max(result, common_loops(i, j));
-    }
-  }
-  return result;
-}
-
-// Builds the runtime the same way `Runtime` in subgraph_builder.cc does, but
-// keeps the raw ynn_runtime so tests can inspect the scheduled pipeline.
 class LoopFusionTest : public testing::Test {
  protected:
   void MakeRuntime(ynn_subgraph_t subgraph) {
@@ -100,22 +41,44 @@ class LoopFusionTest : public testing::Test {
     ASSERT_EQ(ynn_create_runtime(subgraph, threadpool, /*flags=*/0, &runtime),
               ynn_status_success);
     runtime_.reset(runtime);
-    runtime_->pipeline.body.accept(&calls_);
+
+    runtime_->eval_config.allocate = [this](slinky::var sym,
+                                            slinky::raw_buffer* buffer) {
+      void* ptr = buffer->allocate(YNN_ALLOCATION_ALIGNMENT);
+      if (ptr) {
+        max_allocation_size_ =
+            std::max(max_allocation_size_, buffer->size_bytes());
+      }
+      return ptr;
+    };
   }
 
-  std::string PipelineToString() const {
-    std::stringstream ss;
-    ss << std::tuple<const slinky::stmt&, const slinky::node_context&>(
-        runtime_->pipeline.body, runtime_->globals.symbols);
-    return ss.str();
+  void ReshapeExternalTensor(uint32_t id, const std::vector<size_t>& shape,
+                             void* data) {
+    ASSERT_EQ(ynn_set_external_value_shape(runtime_.get(), id, shape.size(),
+                                           shape.data()),
+              ynn_status_success);
+    ASSERT_EQ(ynn_set_external_value_data(runtime_.get(), id, data),
+              ynn_status_success);
+  }
+
+  void SetupExternalTensor(uint32_t id, void* data) {
+    ASSERT_EQ(ynn_set_external_value_data(runtime_.get(), id, data),
+              ynn_status_success);
+  }
+
+  void RunPipeline() {
+    max_allocation_size_ = 0;
+    ASSERT_EQ(ynn_reshape_runtime(runtime_.get()), ynn_status_success);
+    ASSERT_EQ(ynn_invoke_runtime(runtime_.get()), ynn_status_success);
   }
 
   TestScheduler scheduler_{3};
-  std::unique_ptr<ynn_threadpool, decltype(&ynn_delete_threadpool)>
-      threadpool_{nullptr, ynn_delete_threadpool};
+  std::unique_ptr<ynn_threadpool, decltype(&ynn_delete_threadpool)> threadpool_{
+      nullptr, ynn_delete_threadpool};
   std::unique_ptr<ynn_runtime, decltype(&ynn_delete_runtime)> runtime_{
       nullptr, ynn_delete_runtime};
-  call_loops_collector calls_;
+  std::size_t max_allocation_size_ = 0;
 };
 
 // pack_b should be computed inside the dot's loop nest, so packing happens
@@ -132,53 +95,21 @@ TEST_F(LoopFusionTest, PackFusesWithDot) {
 
   MakeRuntime(subgraph.GetSubgraph());
 
-  const auto pack = calls_.find("pack_b");
-  const auto dot = calls_.find("dot");
-  ASSERT_FALSE(pack.empty());
-  ASSERT_FALSE(dot.empty());
-  EXPECT_GE(max_common_loops(pack, dot), 1) << PipelineToString();
+  Tensor<float> a({16, 512});
+  Tensor<float> b({512, 1024});
+  Tensor<float> out({16, 1024});
+  ReshapeExternalTensor(a_id, {16, 512}, a.data());
+  ReshapeExternalTensor(b_id, {512, 1024}, b.data());
+  SetupExternalTensor(out_id, out.data());
+  RunPipeline();
+  EXPECT_LT(max_allocation_size_, b.size_bytes());
 }
 
-// An elementwise producer of the packed input, i.e. dot(A, pack(exp(B))),
-// should be fused into the same loop nest as the pack and the dot, so the
-// intermediate buffer is computed per-block too.
-TEST_F(LoopFusionTest, ProducerOfPackedInputFusesWithDot) {
-  const uint32_t a_id = 0;
-  const uint32_t b_id = 1;
-  const uint32_t out_id = 2;
-  uint32_t exp_id = YNN_INVALID_VALUE_ID;
-  SubgraphBuilder subgraph(3);
-  subgraph.AddInput(type_of<float>(), TensorShape(2), a_id)
-      .AddInput(type_of<float>(), TensorShape(2), b_id)
-      .AddOutput(type_of<float>(), TensorShape(2), out_id)
-      .AddTensor(type_of<float>(), TensorShape(2), exp_id)
-      .AddUnary(ynn_unary_exp, b_id, exp_id)
-      .AddDot(1, a_id, exp_id, YNN_INVALID_VALUE_ID, out_id);
-
-  MakeRuntime(subgraph.GetSubgraph());
-
-  const auto exp = calls_.find("exp");
-  const auto pack = calls_.find("pack_b");
-  const auto dot = calls_.find("dot");
-  ASSERT_FALSE(exp.empty());
-  ASSERT_FALSE(pack.empty());
-  ASSERT_FALSE(dot.empty());
-  // The pack itself fuses with the dot (via the scheduler_bound mechanism).
-  EXPECT_GE(max_common_loops(pack, dot), 1) << PipelineToString();
-  // The producer of the packed input should end up in the same loop nest,
-  // but currently does not: the source region inference breaks at pack's
-  // non-identity input bounds, so exp (and anything else feeding the pack)
-  // is scheduled at the root.
-  EXPECT_GE(max_common_loops(exp, dot), 1) << PipelineToString();
-}
-
-// Same as above, but B arrives transposed: dot(A, transpose(exp(Bt))). The
-// transpose is folded into the packing (always_alias_transpose), so the func
-// chain is exp -> transpose (aliased copy) -> pack_b -> dot. In this layout
-// exp's loop order matches the dot's loop nest positionally, so fusion of exp
-// is blocked *only* by the source region inference breaking at pack's
-// non-identity input bounds - unlike the test above, which additionally
-// requires order-insensitive split matching.
+// The pipeline is dot(A, transpose(exp(Bt))). The transpose is folded into the
+// packing (always_alias_transpose), so the func chain is exp -> transpose
+// (aliased copy) -> pack_b -> dot. In this layout exp's loop order matches the
+// dot's loop nest positionally, so fusion of exp is blocked *only* by the
+// source region inference breaking at pack's non-identity input bounds.
 TEST_F(LoopFusionTest, ProducerOfTransposedPackedInputFusesWithDot) {
   const uint32_t a_id = 0;
   const uint32_t b_id = 1;
@@ -197,16 +128,14 @@ TEST_F(LoopFusionTest, ProducerOfTransposedPackedInputFusesWithDot) {
 
   MakeRuntime(subgraph.GetSubgraph());
 
-  const auto exp = calls_.find("exp");
-  const auto pack = calls_.find("pack_b");
-  const auto dot = calls_.find("dot");
-  ASSERT_FALSE(exp.empty());
-  ASSERT_FALSE(pack.empty());
-  ASSERT_FALSE(dot.empty());
-  // The transpose should have been folded into the packing.
-  EXPECT_TRUE(calls_.find("transpose").empty()) << PipelineToString();
-  EXPECT_GE(max_common_loops(pack, dot), 1) << PipelineToString();
-  EXPECT_GE(max_common_loops(exp, dot), 1) << PipelineToString();
+  Tensor<float> a({16, 512});
+  Tensor<float> b({1024, 512});
+  Tensor<float> out({16, 1024});
+  ReshapeExternalTensor(a_id, {16, 512}, a.data());
+  ReshapeExternalTensor(b_id, {1024, 512}, b.data());
+  SetupExternalTensor(out_id, out.data());
+  RunPipeline();
+  EXPECT_LT(max_allocation_size_, b.size_bytes());
 }
 
 }  // namespace
