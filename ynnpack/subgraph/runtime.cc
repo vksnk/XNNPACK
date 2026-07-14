@@ -461,6 +461,10 @@ void ynn_runtime::schedule() {
 
         int matched_split = -1;
         if (consumer_source_region != -1) {
+          // Whether the search has passed over an unmatched (and non-trivial)
+          // split, i.e. matching a later split would reorder the function's
+          // loops.
+          bool out_of_order = false;
           for (int split_i = 0; split_i < loop_splits.size(); ++split_i) {
             if (split_matched[split_i]) continue;
             const ynn::scheduling_split& split = loop_splits[split_i];
@@ -472,6 +476,16 @@ void ynn_runtime::schedule() {
             }
             if (prove_true(split.extent == 1)) {
               // If the split is 1, it doesn't matter if we fuse or not.
+              continue;
+            }
+            if (split.step_is_required && out_of_order) {
+              // A required step means the function deliberately chose the
+              // blocking of this loop, and the loop order is likely a part of
+              // the same deliberate choice. Matching it out of order would
+              // impose that blocking on a nest built for a different order
+              // (e.g. pull a dot under the loops of its elementwise consumer,
+              // overriding the consumer's steps with the dot's tiles), so we
+              // only allow such splits to be matched in their declared order.
               continue;
             }
             // Map the producer's loop variable back to its output dimension
@@ -487,6 +501,7 @@ void ynn_runtime::schedule() {
               matched_split = split_i;
               break;
             }
+            out_of_order = true;
           }
         }
 
