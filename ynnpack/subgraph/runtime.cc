@@ -436,6 +436,17 @@ void ynn_runtime::schedule() {
       std::vector<bool>& split_matched = sched_data.split_matched;
       split_matched.assign(loop_splits.size(), false);
 
+      // Splits with a provable extent of 1 don't need a loop of their own and
+      // must not become levels of the global loop nest: a degenerate level
+      // would block the functions scheduled later from matching the loops
+      // behind it. Treat them as trivially matched, so they are neither
+      // considered for matching nor appended to the nest.
+      for (int split_i = 0; split_i < loop_splits.size(); ++split_i) {
+        if (prove_true(loop_splits[split_i].extent == 1)) {
+          split_matched[split_i] = true;
+        }
+      }
+
       // Walk the loop nest from the outermost loop inwards. For each loop,
       // find a split of this function which covers the same source region.
       // The splits don't have to be matched in their declared order: loops
@@ -473,10 +484,6 @@ void ynn_runtime::schedule() {
               // likely being broadcasted here, and we don't reorder other
               // splits across it either.
               break;
-            }
-            if (prove_true(split.extent == 1)) {
-              // If the split is 1, it doesn't matter if we fuse or not.
-              continue;
             }
             if (split.step_is_required && out_of_order) {
               // A required step means the function deliberately chose the
