@@ -167,5 +167,32 @@ TEST_F(LoopFusionTest, ProducerOfTransposedPackedInputFusesWithDot) {
   EXPECT_LT(max_allocation_size_, b.size_bytes());
 }
 
+// Like PackFusesWithDot, but with static shapes and a batch dimension of 1.
+// With static shapes the scheduler can prove facts about extents (e.g. that
+// the batch split has an extent of 1) and makes different decisions than for
+// dynamic shapes, which the other tests here use exclusively.
+TEST_F(LoopFusionTest, PackFusesWithStaticShapeDot) {
+  const size_t M = 16, K = 512, N = 1024;
+  const uint32_t a_id = 0;
+  const uint32_t b_id = 1;
+  const uint32_t out_id = 2;
+  SubgraphBuilder subgraph(3);
+  subgraph.AddInput(type_of<float>(), {1, M, K}, a_id)
+      .AddInput(type_of<float>(), {1, K, N}, b_id)
+      .AddOutput(type_of<float>(), {1, M, N}, out_id)
+      .AddDot(1, a_id, b_id, YNN_INVALID_VALUE_ID, out_id);
+
+  MakeRuntime(subgraph.GetSubgraph());
+
+  Tensor<float> a({1, M, K});
+  Tensor<float> b({1, K, N});
+  Tensor<float> out({1, M, N});
+  ReshapeExternalTensor(a_id, {1, M, K}, a.data());
+  ReshapeExternalTensor(b_id, {1, K, N}, b.data());
+  SetupExternalTensor(out_id, out.data());
+  RunPipeline();
+  EXPECT_LT(max_allocation_size_, b.size_bytes());
+}
+
 }  // namespace
 }  // namespace ynn
