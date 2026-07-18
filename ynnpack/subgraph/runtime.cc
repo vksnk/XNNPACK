@@ -97,7 +97,13 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     return {};
   }
 
-  int max_threads = threadpool() ? threadpool()->thread_count() : 1;
+  // `thread_count()` reports the number of background worker threads. The thread
+  // that invokes the runtime also participates as a worker (it runs tasks while
+  // waiting in `thread_pool::wait_for`), so the effective parallelism is one
+  // more than the reported count. Without this `+ 1`, a pool with a single
+  // background thread (two threads of execution in total) would be scheduled
+  // serially, and every other size would be sized one worker short.
+  int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
   // Enough tasks to have good load balancing.
   slinky::index_t target_task_count = max_threads > 1 ? max_threads * 2 : 1;
 

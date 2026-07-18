@@ -1,5 +1,7 @@
 #include "ynnpack/subgraph/test/scheduler.h"
 
+#include <algorithm>
+
 #include "ynnpack/include/ynnpack.h"
 #include "slinky/base/thread_pool_impl.h"
 
@@ -14,6 +16,11 @@ namespace ynn {
 // invoke pthread_create
 //   synchronously, and we must match the pre-allocated PTHREAD_POOL_SIZE linked
 //   during build.
+//
+// `thread_count` here is the number of *background* worker threads. The thread
+// that invokes the runtime also participates as a worker; the runtime accounts
+// for it separately (see make_schedule), so `num_threads()` reports only the
+// background count.
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 TestScheduler::TestScheduler(int) : impl_(0) {}
 #elif defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)

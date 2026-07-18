@@ -3,6 +3,8 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
+#include <benchmark/benchmark.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -14,7 +16,6 @@
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/subgraph/test/attention_graph.h"
 #include "ynnpack/subgraph/test/scheduler.h"
-#include <benchmark/benchmark.h>
 
 namespace ynn {
 namespace {
@@ -42,7 +43,10 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
   const int s_active = std::min<int>(s, static_cast<int>(state.range(5)));
   const float scale = 1.0f / std::sqrt(static_cast<float>(h));
 
-  TestScheduler scheduler(num_threads);
+  // The `threads` argument is the total number of threads that should run the
+  // work. The runtime's invoking thread participates as a worker, so the
+  // scheduler only needs `num_threads - 1` background threads.
+  TestScheduler scheduler(num_threads - 1);
   ynn_threadpool_t threadpool_raw = nullptr;
   ynn_create_threadpool(TestScheduler::scheduler(), &scheduler, 0,
                         &threadpool_raw);
@@ -230,7 +234,7 @@ void AttentionArguments(benchmark::Benchmark* b) {
   for (bool dynamic : {false, true}) {
     for (const auto& shape : shapes) {
       for (int threads : {1, 2, 4}) {
-        for (float s_fraction : {0.01f, 0.5f, 0.99f, 1.0f}) {
+        for (float s_fraction : {/*0.01f, 0.5f, 0.99f, */ 1.0f}) {
           const int s_active = std::ceil(s_fraction * shape[0]);
           b->Args({dynamic, shape[0], shape[1], shape[2], threads, s_active});
         }
