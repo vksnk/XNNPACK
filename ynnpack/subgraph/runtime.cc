@@ -98,47 +98,20 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     return {};
   }
 
-  // `thread_count()` reports the number of background worker threads. The
-  // thread that invokes the runtime also participates as a worker (it runs
-  // tasks while waiting in `thread_pool::wait_for`), so the effective
-  // parallelism is one more than the reported count. Without this `+ 1`, a pool
-  // with a single background thread (two threads of execution in total) would
-  // be scheduled serially, and every other size would be sized one worker
-  // short.
-  int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
-
-  // Enough tasks to have good load balancing.
-  slinky::index_t target_task_count = max_threads > 1 ? max_threads * 2 : 1;
-
-  std::vector<slinky::expr> workers(rank);
-  slinky::expr threads_so_far = 1;
-
   auto get_loop_dim = [&](int index_d) {
     return index_d < loop_order.size() ? loop_order[index_d] : index_d;
   };
 
-  for (int index_d = rank - 1; index_d >= 0; --index_d) {
-    int d = get_loop_dim(index_d);
-    if (max_threads == 1 || globals.is_reduction_dim(dims[d])) {
-      workers[d] = slinky::loop::serial;
-    } else if (extents[d].defined() && splits[d].defined()) {
-      slinky::expr w =
-          slinky::ceil_div(slinky::expr(target_task_count), threads_so_far);
-      w = globals.get(w, "w");
-
-      workers[d] = slinky::simplify(slinky::select::make(
-          w > 1, slinky::loop::parallel, slinky::loop::serial));
-
-      threads_so_far =
-          slinky::simplify(threads_so_far * ceil_div(extents[d], splits[d]));
-    }
-  }
-
+  // Note that the splits don't say how many workers each loop should use:
+  // after fusion, a function's loops can end up inside loops of other
+  // functions, so the parallelism available to each loop is only known once
+  // the global loop nest is complete. schedule() computes the workers for the
+  // whole nest at once.
   std::vector<ynn::scheduling_split> loop_splits;
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
     if (extents[d].defined() && splits[d].defined()) {
-      loop_splits.push_back({dims[d], splits[d], workers[d], extents[d]});
+      loop_splits.push_back({dims[d], splits[d], extents[d]});
     }
   }
 
@@ -348,6 +321,13 @@ struct loop_level {
   slinky::expr extent;
   slinky::expr step;
   bool step_is_required = false;
+  // The index of the parent loop in the global loop nest, or -1 for the
+  // outermost loops. Loops are appended after their parent, so the parent
+  // index is always less than the index of the loop itself.
+  int parent = -1;
+  // The number of workers the loop should use, computed by compute_workers()
+  // once the whole nest is built.
+  slinky::expr workers = slinky::loop::serial;
 };
 
 struct scheduling_data {
@@ -371,6 +351,40 @@ struct scheduling_data {
   // function's own loops.
   std::vector<bool> split_matched;
 };
+
+// Decide how many workers each loop of the global nest should use. This must
+// run after the whole nest is built (and all the steps are final): after
+// fusion, a function's loops can end up inside loops of other functions, so
+// the number of tasks produced outside each loop is only known once the nest
+// is complete.
+void compute_workers(ynn::slinky_globals& globals, int max_threads,
+                     std::vector<loop_level>& global_loop_nest) {
+  // Enough tasks to have good load balancing.
+  const slinky::index_t target_task_count =
+      max_threads > 1 ? max_threads * 2 : 1;
+
+  // The number of tasks the loops from the root down to (and including) each
+  // loop can produce. Serial loops (reductions) run their iterations within
+  // one task, so they don't contribute to this count.
+  std::vector<slinky::expr> tasks(global_loop_nest.size());
+  for (size_t i = 0; i < global_loop_nest.size(); ++i) {
+    loop_level& l = global_loop_nest[i];
+    assert(l.parent < static_cast<int>(i));
+    slinky::expr tasks_above = l.parent >= 0 ? tasks[l.parent] : 1;
+    if (max_threads == 1 || globals.is_reduction_dim(l.loop_id.var)) {
+      l.workers = slinky::loop::serial;
+      tasks[i] = tasks_above;
+    } else {
+      slinky::expr w =
+          slinky::ceil_div(slinky::expr(target_task_count), tasks_above);
+      w = globals.get(w, "w");
+      l.workers = slinky::simplify(slinky::select::make(
+          w > 1, slinky::loop::parallel, slinky::loop::serial));
+      tasks[i] =
+          slinky::simplify(tasks_above * slinky::ceil_div(l.extent, l.step));
+    }
+  }
+}
 
 // Prints the decisions made by the scheduler to stderr, for debugging. This
 // is the only place that formats or prints any of the scheduler's state;
@@ -403,15 +417,6 @@ void dump_schedule(slinky::node_context& symbols,
     return ss.str();
   };
 
-  // Reconstruct the tree of the loop nest from the per-function paths: the
-  // parent of a loop is the entry which precedes it in any path containing
-  // it (paths sharing a loop share the whole prefix above it).
-  std::vector<int> parent(global_loop_nest.size(), -1);
-  for (const scheduling_data& sched_data : func_scheduling_data) {
-    for (size_t j = 1; j < sched_data.loop_nest.size(); ++j) {
-      parent[sched_data.loop_nest[j]] = sched_data.loop_nest[j - 1];
-    }
-  }
   // The index of the function which created a loop, so loops can be ordered
   // by it below.
   std::map<const slinky::func*, int> func_index;
@@ -422,10 +427,10 @@ void dump_schedule(slinky::node_context& symbols,
   std::vector<std::vector<int>> children(global_loop_nest.size());
   std::vector<int> roots;
   for (size_t i = 0; i < global_loop_nest.size(); ++i) {
-    if (parent[i] == -1) {
+    if (global_loop_nest[i].parent == -1) {
       roots.push_back(i);
     } else {
-      children[parent[i]].push_back(i);
+      children[global_loop_nest[i].parent].push_back(i);
     }
   }
 
@@ -486,7 +491,7 @@ void dump_schedule(slinky::node_context& symbols,
         const loop_level& l = global_loop_nest[i];
         ss << indent << "[" << i << "] " << func_name(l.loop_id.func) << ":"
            << symbols.name(l.loop_id.var) << " extent=" << l.extent
-           << " step=" << l.step
+           << " step=" << l.step << " workers=" << l.workers
            << (l.step_is_required ? " (step required)" : "") << "\n";
         self(self, i, indent + "  ");
         ++child_it;
@@ -739,8 +744,10 @@ void ynn_runtime::schedule() {
       for (int j = 0; j < loop_splits.size(); j++) {
         if (sched_data.split_matched[j]) continue;
         const ynn::scheduling_split& dim = loop_splits[j];
+        const int parent = loop_nest.empty() ? -1 : loop_nest.back();
         global_loop_nest.push_back(
-            {{&f, dim.var}, dim.extent, dim.step, dim.step_is_required});
+            {{&f, dim.var}, dim.extent, dim.step, dim.step_is_required,
+             parent});
         loop_nest.push_back(global_loop_nest.size() - 1);
       }
     }
@@ -750,6 +757,16 @@ void ynn_runtime::schedule() {
       consumers[input.buffer->sym()].push_back(i);
     }
   }
+
+  // `thread_count()` reports the number of background worker threads. The
+  // thread that invokes the runtime also participates as a worker (it runs
+  // tasks while waiting in `thread_pool::wait_for`), so the effective
+  // parallelism is one more than the reported count. Without this `+ 1`, a
+  // pool with a single background thread (two threads of execution in total)
+  // would be scheduled serially, and every other size would be sized one
+  // worker short.
+  const int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
+  compute_workers(globals, max_threads, global_loop_nest);
 
   // Use previously computed information to actually schedule the functions.
   for (int i = funcs.size() - 1; i >= 0; --i) {
@@ -796,17 +813,16 @@ void ynn_runtime::schedule() {
       // are loops of the function this one was fused into). The j-th
       // unmatched split from the innermost corresponds to the j-th innermost
       // entry of the loop nest, which tracks the (possibly updated by other
-      // fused functions) step of the loop.
+      // fused functions) step of the loop and the globally computed workers.
       std::vector<slinky::func::loop_info> loops;
       for (int i = 0; i < loop_splits.size(); ++i) {
         // loop_splits was reversed back to its original order, but
         // split_matched is indexed in the reversed order used for matching.
         if (split_matched[loop_splits.size() - 1 - i]) continue;
         const ynn::scheduling_split& dim = loop_splits[i];
-        slinky::expr step =
-            global_loop_nest[loop_nest[loop_nest.size() - loops.size() - 1]]
-                .step;
-        loops.push_back({dim.var, step, dim.workers});
+        const loop_level& level =
+            global_loop_nest[loop_nest[loop_nest.size() - loops.size() - 1]];
+        loops.push_back({dim.var, level.step, level.workers});
       }
 
       f.loops(std::move(loops));

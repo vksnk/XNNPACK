@@ -127,7 +127,6 @@ std::vector<slinky::expr> make_split_factors(
 struct scheduling_split {
   slinky::var var;
   slinky::expr step;
-  slinky::expr workers = slinky::loop::parallel;
   slinky::expr extent;
   // If this is true the corresponding loop is required to have this specific
   // step, i.e. it can not get scheduled in the loop of the other function
