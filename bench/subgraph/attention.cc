@@ -752,6 +752,14 @@ static void AttentionArguments(benchmark::Benchmark* b) {
   // Decoding: a single query token attending over a large KV.
   b->Args({1, 64, 32, 1024});
   b->Args({1, 64, 32, 4096});
+  // Shapes matching ynnpack's attention_bench grid (prefill T == S, decode
+  // T == 1); the N=32 shapes are already covered above.
+  b->Args({256, 64, 8, 256});
+  b->Args({512, 64, 8, 512});
+  b->Args({1024, 64, 8, 1024});
+  b->Args({1, 64, 8, 256});
+  b->Args({1, 64, 8, 512});
+  b->Args({1, 64, 8, 1024});
 }
 
 BENCHMARK(FP32Attention)
