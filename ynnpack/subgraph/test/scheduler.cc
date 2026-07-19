@@ -14,6 +14,9 @@ namespace ynn {
 // invoke pthread_create
 //   synchronously, and we must match the pre-allocated PTHREAD_POOL_SIZE linked
 //   during build.
+//
+// `thread_count` here is the number of *background* worker threads. The thread
+// that invokes the runtime also participates as a worker.
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 TestScheduler::TestScheduler(int) : impl_(0) {}
 #elif defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)

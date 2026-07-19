@@ -42,7 +42,11 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
   const int s_active = std::min<int>(s, static_cast<int>(state.range(5)));
   const float scale = 1.0f / std::sqrt(static_cast<float>(h));
 
-  TestScheduler scheduler(num_threads);
+  // The `threads` argument is the total number of threads that should run the
+  // work. The runtime's invoking thread participates as a worker, so the
+  // scheduler only needs `num_threads - 1` background threads.
+  TestScheduler scheduler(num_threads - 1);
+
   ynn_threadpool_t threadpool_raw = nullptr;
   ynn_create_threadpool(TestScheduler::scheduler(), &scheduler, 0,
                         &threadpool_raw);

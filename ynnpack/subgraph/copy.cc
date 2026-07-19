@@ -84,6 +84,11 @@ void deduce_reshape_extent(ynn_node& node, int input_idx,
         {"invalid deduced reshape in dimension ", deduce_dim, " of ",
          ynn_node::input_idx{input_idx}},
     });
+  } else {
+    node.checks.push_back({
+        num_elements == current_elements,
+        {"invalid reshape of ", ynn_node::input_idx{input_idx}},
+    });
   }
 }
 

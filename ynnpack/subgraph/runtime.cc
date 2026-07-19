@@ -98,7 +98,15 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     return {};
   }
 
-  int max_threads = threadpool() ? threadpool()->thread_count() : 1;
+  // `thread_count()` reports the number of background worker threads. The
+  // thread that invokes the runtime also participates as a worker (it runs
+  // tasks while waiting in `thread_pool::wait_for`), so the effective
+  // parallelism is one more than the reported count. Without this `+ 1`, a pool
+  // with a single background thread (two threads of execution in total) would
+  // be scheduled serially, and every other size would be sized one worker
+  // short.
+  int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
+
   // Enough tasks to have good load balancing.
   slinky::index_t target_task_count = max_threads > 1 ? max_threads * 2 : 1;
 
@@ -864,7 +872,7 @@ auto make_reshape_impl(ynn_runtime* runtime) {
       }
     }
     if (errors) {
-      return ynn_status_error;
+      return ynn_status_invalid_parameter;
     }
 
     for (auto& i : runtime->values) {
@@ -1087,8 +1095,9 @@ ynn_status ynn_runtime::build() {
 
 ynn_status ynn_runtime::reshape() {
   setup();
-  return slinky::evaluate(reshape_impl, eval_context) ? ynn_status_error
-                                                      : ynn_status_success;
+  slinky::index_t result = slinky::evaluate(reshape_impl, eval_context);
+  static_assert(ynn_status_success == 0, "");
+  return static_cast<ynn_status>(result);
 }
 
 ynn_status ynn_runtime::setup() {
