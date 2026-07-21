@@ -102,11 +102,6 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     return index_d < loop_order.size() ? loop_order[index_d] : index_d;
   };
 
-  // Note that the splits don't say how many workers each loop should use:
-  // after fusion, a function's loops can end up inside loops of other
-  // functions, so the parallelism available to each loop is only known once
-  // the global loop nest is complete. schedule() computes the workers for the
-  // whole nest at once.
   std::vector<ynn::scheduling_split> loop_splits;
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
@@ -121,6 +116,43 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
 }
 
 namespace {
+
+// Just a helper structure to track information about loop levels.
+struct loop_level {
+  slinky::loop_id loop_id;
+  slinky::expr extent;
+  slinky::expr step;
+  bool step_is_required = false;
+  // The index of the parent loop in the global loop nest, or -1 for the
+  // outermost loops. Loops are appended after their parent, so the parent
+  // index is always less than the index of the loop itself.
+  int parent = -1;
+  // The number of workers the loop should use, computed by compute_workers()
+  // once the whole nest is built.
+  slinky::expr workers = slinky::loop::serial;
+};
+
+struct scheduling_data {
+  // Loop nest should be a pair of function and loop_id. This is in fact a
+  // tree, but for the sake of simplicity we store it as a set of pathes
+  // (loop nests in this case) from the root of the tree (outermost
+  // location) to a leaf node (the innermost loop of a given function). Loop
+  // nests for each of the functions scheduled so far with the indices
+  // pointing to the global loop nest. Loop nests can overlap with each
+  // other if functions are scheduled within the same loop (only prefixes,
+  // i.e. from the root of the loop nest to the most innermost common loop).
+  std::vector<int> loop_nest;
+  // Compute_at locations of a function -- this an index within a
+  // loop nest of a given function, i.e from root (0) to the innermost loop
+  // (loop_nest[f_index].back()).
+  int compute_at = 0;
+  // For each split of the function's scheduling_info (in the reversed,
+  // outermost-first order used during matching), whether it was matched to
+  // an existing loop of the nest. Matched splits become loops of the
+  // function this function was fused into; unmatched splits become the
+  // function's own loops.
+  std::vector<bool> split_matched;
+};
 
 template <typename T, typename Target>
 bool find_n(const T* data, size_t size, const Target& x) {
@@ -292,66 +324,6 @@ std::map<std::pair<slinky::var, int>, int> infer_source_regions(
   return source_regions;
 }
 
-}  // namespace
-
-// Logically this function has multiple separate blocks:
-// 1) infer symbolic source regions for all buffers to ensure loops are only
-//    fused if they share a common source region origin.
-// 2) computing a list of possible compute_at locations for a given function.
-//    This is a very concrete thing and doesn't require any heuristics.
-// 3) using the set of locations from 2) decide if we want for this function
-//    to be computed at root or at one of the existing loops based on the
-//    available information such as scheduling_info attached to the function
-//    or source regions inferred in 1).
-// 4) if we decide to share the loop location possibly update loop parameters
-//    such as step based on the specific of the given function (this is pretty
-//    much a no-op right now and is solely defined by a "parent" function of
-//    the loop, but we can use it in the future to figure out, for example, a
-//    step size based on the *all* functions which were assigned to the loop).
-// 5) potentially add new loop(s) into the loop nest based on a given
-//    function.
-// 6) based on compute locations computed in 2) - 5), set up the
-//    func-s. This is done in a separate loop once all of the functions from
-//    the pipeline were processed.
-namespace {
-
-// Just a helper function to track information about loop levels.
-struct loop_level {
-  slinky::loop_id loop_id;
-  slinky::expr extent;
-  slinky::expr step;
-  bool step_is_required = false;
-  // The index of the parent loop in the global loop nest, or -1 for the
-  // outermost loops. Loops are appended after their parent, so the parent
-  // index is always less than the index of the loop itself.
-  int parent = -1;
-  // The number of workers the loop should use, computed by compute_workers()
-  // once the whole nest is built.
-  slinky::expr workers = slinky::loop::serial;
-};
-
-struct scheduling_data {
-  // Loop nest should be a pair of function and loop_id. This is in fact a
-  // tree, but for the sake of simplicity we store it as a set of pathes
-  // (loop nests in this case) from the root of the tree (outermost
-  // location) to a leaf node (the innermost loop of a given function). Loop
-  // nests for each of the functions scheduled so far with the indices
-  // pointing to the global loop nest. Loop nests can overlap with each
-  // other if functions are scheduled within the same loop (only prefixes,
-  // i.e. from the root of the loop nest to the most innermost common loop).
-  std::vector<int> loop_nest;
-  // Compute_at locations of a function -- this an index within a
-  // loop nest of a given function, i.e from root (0) to the innermost loop
-  // (loop_nest[f_index].back()).
-  int compute_at = 0;
-  // For each split of the function's scheduling_info (in the reversed,
-  // outermost-first order used during matching), whether it was matched to
-  // an existing loop of the nest. Matched splits become loops of the
-  // function this function was fused into; unmatched splits become the
-  // function's own loops.
-  std::vector<bool> split_matched;
-};
-
 // Decide how many workers each loop of the global nest should use. This must
 // run after the whole nest is built (and all the steps are final): after
 // fusion, a function's loops can end up inside loops of other functions, so
@@ -385,6 +357,29 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
     }
   }
 }
+
+}  // namespace
+
+// Logically this function has multiple separate blocks:
+// 1) infer symbolic source regions for all buffers to ensure loops are only
+//    fused if they share a common source region origin.
+// 2) computing a list of possible compute_at locations for a given function.
+//    This is a very concrete thing and doesn't require any heuristics.
+// 3) using the set of locations from 2) decide if we want for this function
+//    to be computed at root or at one of the existing loops based on the
+//    available information such as scheduling_info attached to the function
+//    or source regions inferred in 1).
+// 4) if we decide to share the loop location possibly update loop parameters
+//    such as step based on the specific of the given function (this is pretty
+//    much a no-op right now and is solely defined by a "parent" function of
+//    the loop, but we can use it in the future to figure out, for example, a
+//    step size based on the *all* functions which were assigned to the loop).
+// 5) potentially add new loop(s) into the loop nest based on a given
+//    function.
+// 6) based on compute locations computed in 2) - 5), set up the
+//    func-s. This is done in a separate loop once all of the functions from
+//    the pipeline were processed.
+namespace {
 
 // Prints the decisions made by the scheduler to stderr, for debugging. This
 // is the only place that formats or prints any of the scheduler's state;
@@ -745,9 +740,11 @@ void ynn_runtime::schedule() {
         if (sched_data.split_matched[j]) continue;
         const ynn::scheduling_split& dim = loop_splits[j];
         const int parent = loop_nest.empty() ? -1 : loop_nest.back();
-        global_loop_nest.push_back(
-            {{&f, dim.var}, dim.extent, dim.step, dim.step_is_required,
-             parent});
+        global_loop_nest.push_back({{&f, dim.var},
+                                    dim.extent,
+                                    dim.step,
+                                    dim.step_is_required,
+                                    parent});
         loop_nest.push_back(global_loop_nest.size() - 1);
       }
     }
