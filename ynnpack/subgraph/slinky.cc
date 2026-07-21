@@ -227,9 +227,14 @@ std::vector<slinky::expr> make_split_factors(
     return index_d < loop_order.size() ? loop_order[index_d] : index_d;
   };
 
+  // The effective alignment of a dimension. A dimension never uses more than
+  // its extent of the area, so the reservation is capped by the extent to
+  // avoid setting aside area the dimension can't use.
   auto alignment_of = [&](int d) {
-    return d < alignments.size() && alignments[d].defined() ? alignments[d]
-                                                            : slinky::expr(1);
+    if (d < alignments.size() && alignments[d].defined()) {
+      return slinky::simplify(slinky::min(alignments[d], extents[d]));
+    }
+    return slinky::expr(1);
   };
 
   // Reserve one alignment-sized block for every dimension whose split we are
@@ -247,6 +252,11 @@ std::vector<slinky::expr> make_split_factors(
     if (!extents[d].defined()) continue;
     if (d < given_splits.size()) {
       splits[d] = given_splits[d];
+      if (splits[d].defined()) {
+        tile_area_so_far = slinky::simplify(tile_area_so_far * splits[d]);
+      } else {
+        tile_area_so_far = slinky::simplify(tile_area_so_far * extents[d]);
+      }
     } else {
       const slinky::expr align = alignment_of(d);
       // tile_area_so_far includes this dimension's own reservation, so the
@@ -258,11 +268,11 @@ std::vector<slinky::expr> make_split_factors(
           slinky::max(align, slinky::min(align * blocks, extents[d])));
       s = globals.get(s, "s");
       splits[d] = s;
-    }
-    if (splits[d].defined()) {
-      tile_area_so_far = slinky::simplify(tile_area_so_far * splits[d]);
-    } else {
-      tile_area_so_far = slinky::simplify(tile_area_so_far * extents[d]);
+      // The reservation is already a factor of tile_area_so_far, so multiply
+      // by the number of blocks the split uses rather than by the split
+      // itself.
+      tile_area_so_far = slinky::simplify(tile_area_so_far *
+                                          slinky::ceil_div(splits[d], align));
     }
   }
   return splits;
