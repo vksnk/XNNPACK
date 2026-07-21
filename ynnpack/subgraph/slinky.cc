@@ -211,7 +211,8 @@ std::vector<slinky::expr> make_split_factors(
     ynn::slinky_globals& globals, ynn::span<const slinky::expr> extents,
     const slinky::expr& element_cost,
     ynn::span<const slinky::expr> given_splits,
-    ynn::span<const int> loop_order) {
+    ynn::span<const int> loop_order,
+    ynn::span<const slinky::expr> alignments) {
   const int rank = extents.size();
 
   // Area is selected such that tiles fit better into cache, this is a
@@ -226,6 +227,20 @@ std::vector<slinky::expr> make_split_factors(
     return index_d < loop_order.size() ? loop_order[index_d] : index_d;
   };
 
+  auto alignment_of = [&](int d) {
+    return d < alignments.size() && alignments[d].defined() ? alignments[d]
+                                                            : slinky::expr(1);
+  };
+
+  // Reserve one alignment-sized block for every dimension whose split we are
+  // going to compute, so dimensions earlier in the loop order can't consume
+  // the area later dimensions need for their minimal split.
+  slinky::expr reserved = 1;
+  for (int d = 0; d < rank; ++d) {
+    if (!extents[d].defined() || d < given_splits.size()) continue;
+    reserved = slinky::simplify(reserved * alignment_of(d));
+  }
+
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
     assert(d < extents.size());
@@ -233,8 +248,15 @@ std::vector<slinky::expr> make_split_factors(
     if (d < given_splits.size()) {
       splits[d] = given_splits[d];
     } else {
+      const slinky::expr align = alignment_of(d);
+      // This dimension's own reservation is spent now.
+      reserved = slinky::simplify(reserved / align);
+      slinky::expr available =
+          tile_area / slinky::simplify(tile_area_so_far * reserved);
+      // Use as much of the available area as possible while keeping the split
+      // a multiple of the alignment, but never less than one aligned block.
       slinky::expr s = slinky::simplify(slinky::max(
-          1, slinky::min(tile_area / tile_area_so_far, extents[d])));
+          align, slinky::min((available / align) * align, extents[d])));
       s = globals.get(s, "s");
       splits[d] = s;
     }

@@ -523,8 +523,29 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
   }
 
   if (op != ynn_reduce_min_max) {
+    // Give the reduction dimensions the first claim on the tile area: a
+    // partial reduction is only worth creating when a reduction dimension
+    // doesn't fit in a tile, so the kept dimensions must not starve it of the
+    // budget.
+    std::vector<int> budget_order;
+    for (int i = 0; i < a.rank(); ++i) {
+      if (k_dims[i]) budget_order.push_back(i);
+    }
+    for (int i = 0; i < a.rank(); ++i) {
+      if (!k_dims[i]) budget_order.push_back(i);
+    }
+    // Keep the split of the innermost dimension a multiple of the vector width
+    // so its tiles don't degenerate to scalar-width columns when another
+    // dimension takes most of the tile area.
+    // TODO(vksnk): Take the vector width from the kernel instead of assuming
+    // 64 bytes.
+    const size_t elem_size = type_size_bytes(a.type);
+    std::vector<slinky::expr> alignments = {slinky::expr(
+        elem_size > 0 && elem_size < 64 ? 64 / (slinky::index_t)elem_size
+                                        : 1)};
     std::vector<slinky::expr> split_factors = make_split_factors(
-        subgraph->globals, a.extents, type_size_bytes(a.type));
+        subgraph->globals, a.extents, type_size_bytes(a.type),
+        /*given_splits=*/{}, budget_order, alignments);
 
     // We should only do a partial reduction if we can prove that a dimension is
     // split. If needed, we could add a flag that would indicate we should

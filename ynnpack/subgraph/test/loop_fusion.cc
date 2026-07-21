@@ -240,5 +240,64 @@ TEST_F(LoopFusionTest, ConstantFoldedPackIsParallel) {
 #endif  // !YNN_ARCH_WASM_SIMD128
 }
 
+// A reduction whose reduction dimension fits in a single tile should not be
+// split into a partial + final reduction pair. The reduction dimensions get
+// the first claim on the tile area, so a large kept dimension can not starve
+// them of the budget; without that, this reduce would create a partial
+// reduction with a tiny reduction step that materializes a nearly input-sized
+// intermediate.
+TEST_F(LoopFusionTest, ReductionFittingTileHasNoPartialReduction) {
+  const size_t K = 256, N = 16384;
+  const uint32_t in_id = 0;
+  const uint32_t out_id = 1;
+  SubgraphBuilder subgraph(2);
+  subgraph.AddInput(type_of<float>(), TensorShape({K, N}), in_id)
+      .AddOutput(type_of<float>(), TensorShape({N}), out_id)
+      .AddReduce(ynn_reduce_sum, {0}, in_id, YNN_INVALID_VALUE_ID, out_id);
+
+  MakeRuntime(subgraph.GetSubgraph());
+
+  Tensor<float> in({K, N});
+  Tensor<float> out({N});
+  in.fill(1.0f);
+  ReshapeExternalTensor(in_id, {K, N}, in.data());
+  SetupExternalTensor(out_id, out.data());
+  RunPipeline();
+  // A single-stage reduction has no intermediates to materialize.
+  EXPECT_EQ(max_allocation_size_, 0u);
+  for (size_t j = 0; j < N; ++j) {
+    ASSERT_EQ(out({j}), 1.0f * K) << j;
+  }
+}
+
+// A reduction over a dimension much larger than the tile area should still be
+// split into a partial + final reduction pair, with a cache-sized reduction
+// step rather than an intermediate comparable to the input.
+TEST_F(LoopFusionTest, LargeReductionUsesPartialReduction) {
+  const size_t K = 65536, N = 64;
+  const uint32_t in_id = 0;
+  const uint32_t out_id = 1;
+  SubgraphBuilder subgraph(2);
+  subgraph.AddInput(type_of<float>(), TensorShape({K, N}), in_id)
+      .AddOutput(type_of<float>(), TensorShape({N}), out_id)
+      .AddReduce(ynn_reduce_sum, {0}, in_id, YNN_INVALID_VALUE_ID, out_id);
+
+  MakeRuntime(subgraph.GetSubgraph());
+
+  Tensor<float> in({K, N});
+  Tensor<float> out({N});
+  in.fill(1.0f);
+  ReshapeExternalTensor(in_id, {K, N}, in.data());
+  SetupExternalTensor(out_id, out.data());
+  RunPipeline();
+  // The partial reduction materializes an intermediate, but it should be far
+  // smaller than the input.
+  EXPECT_GT(max_allocation_size_, 0u);
+  EXPECT_LT(max_allocation_size_, K * N * sizeof(float) / 64);
+  for (size_t j = 0; j < N; ++j) {
+    ASSERT_EQ(out({j}), 1.0f * K) << j;
+  }
+}
+
 }  // namespace
 }  // namespace ynn
