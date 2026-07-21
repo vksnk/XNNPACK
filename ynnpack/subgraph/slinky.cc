@@ -233,12 +233,12 @@ std::vector<slinky::expr> make_split_factors(
   };
 
   // Reserve one alignment-sized block for every dimension whose split we are
-  // going to compute, so dimensions earlier in the loop order can't consume
-  // the area later dimensions need for their minimal split.
-  slinky::expr reserved = 1;
+  // going to compute by pre-multiplying the alignments into the used area, so
+  // dimensions earlier in the loop order can't consume the area later
+  // dimensions need for their minimal split.
   for (int d = 0; d < rank; ++d) {
     if (!extents[d].defined() || d < given_splits.size()) continue;
-    reserved = slinky::simplify(reserved * alignment_of(d));
+    tile_area_so_far = slinky::simplify(tile_area_so_far * alignment_of(d));
   }
 
   for (int index_d = 0; index_d < rank; ++index_d) {
@@ -249,14 +249,13 @@ std::vector<slinky::expr> make_split_factors(
       splits[d] = given_splits[d];
     } else {
       const slinky::expr align = alignment_of(d);
-      // This dimension's own reservation is spent now.
-      reserved = slinky::simplify(reserved / align);
-      slinky::expr available =
-          tile_area / slinky::simplify(tile_area_so_far * reserved);
-      // Use as much of the available area as possible while keeping the split
-      // a multiple of the alignment, but never less than one aligned block.
-      slinky::expr s = slinky::simplify(slinky::max(
-          align, slinky::min((available / align) * align, extents[d])));
+      // tile_area_so_far includes this dimension's own reservation, so the
+      // quotient is the number of whole alignment-sized blocks of the area
+      // available to this dimension.
+      slinky::expr blocks = tile_area / tile_area_so_far;
+      // Use as many whole blocks as possible, but never less than one.
+      slinky::expr s = slinky::simplify(
+          slinky::max(align, slinky::min(align * blocks, extents[d])));
       s = globals.get(s, "s");
       splits[d] = s;
     }
