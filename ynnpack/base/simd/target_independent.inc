@@ -161,19 +161,14 @@ YNN_ALWAYS_INLINE vec<T, N> divide(vec<T, N> a, decltype(one)) {
 
 // Round floating point values assuming the integer value can fit in the
 // mantissa of the result.
-template <size_t N>
-vec<half, N> round_small(vec<half, N> a) {
-  const auto magic = broadcast<N>(static_cast<half>(1.5f * (1 << 10)));
-  return (magic + a) - magic;
-}
-template <size_t N>
-vec<float, N> round_small(vec<float, N> a) {
-  const auto magic = broadcast<N>(1.5f * (1 << 23));
-  return (magic + a) - magic;
-}
-template <size_t N>
-vec<double, N> round_small(vec<double, N> a) {
-  const auto magic = broadcast<N>(1.5 * (1ull << 52));
+constexpr int mantissa_bits(half) { return 10; }
+constexpr int mantissa_bits(float) { return 23; }
+constexpr int mantissa_bits(double) { return 52; }
+
+template <typename T, size_t N>
+vec<T, N> round_small(vec<T, N> a) {
+  const auto magic =
+      broadcast<N>(static_cast<T>(1.5f * (1ull << mantissa_bits(T{}))));
   return (magic + a) - magic;
 }
 
@@ -803,6 +798,133 @@ static vec<float, N> approx_tanh(vec<float, N> x) {
 template <size_t N>
 static vec<half, N> approx_tanh(vec<half, N> x) {
   return tanh(x, precision12{});
+}
+
+namespace internal {
+
+// Returns the range reduced `x` in [-pi/2, pi/2] such that sin(x) computes
+// either sin(x) or cos(x)
+//
+// The constants `half_pi` split -pi/2 into a sum of increasingly precise parts:
+// half_pi[0] ~= -pi/2
+// half_pi[1] ~= -pi/2 - pi_2[0]
+// half_pi[2] ~= -pi/2 - (pi_2[0] + pi_2[1])
+// and so on.
+template <bool IsCos, typename Int, typename T, size_t N, size_t M>
+YNN_ALWAYS_INLINE vec<T, N> range_reduce(vec<T, N> x, const T (&half_pi)[M]) {
+  constexpr T pi = 3.1415926535897932384;
+  constexpr T two_over_pi = 2.0 / pi;
+
+  // Find the integer k such that x = k*pi/2 + x' and x' is in [-pi/4, pi/4].
+  auto k = x * broadcast<N>(two_over_pi);
+
+  // See `round_small` for an explanation of this. We aren't using that helper
+  // because we want to get the intermediate integer value for use below.
+  const auto magic =
+      broadcast<N>(static_cast<T>(1.5f * (1ull << mantissa_bits(T{}))));
+  k += magic;
+  auto k_int = bit_cast<vec<Int, N>>(k);
+  k -= magic;
+
+  // Use the high precision value of half_pi to compute x in [-pi/4, pi/4]
+  for (T i : half_pi) {
+    x = multiply_add(k, broadcast<N>(i), x);
+  }
+
+  auto zero = broadcast<N>(static_cast<Int>(0));
+  auto one = broadcast<N>(static_cast<Int>(1));
+  auto two = broadcast<N>(static_cast<Int>(2));
+
+  // cos(x) = sin(x + pi/2), we can implement this by adding one quadrant to k
+  // if we want cos(x).
+  if (IsCos) {
+    k_int = k_int + one;
+  }
+
+  x = select((k_int & one) == zero, x,
+             broadcast<N>(static_cast<T>(pi / 2)) - abs(x));
+  x = select((k_int & two) == zero, x, -x);
+
+  return x;
+}
+
+// sin(x) ~= x*P(x^2)
+template <typename T, size_t N, typename P>
+YNN_ALWAYS_INLINE vec<T, N> sin_impl(vec<T, N> x, const P& p) {
+  auto x2 = x * x;
+  return eval_polynomial(p, x2) * x;
+}
+
+template <bool IsCos, size_t N>
+static vec<float, N> sincos(vec<float, N> x) {
+  constexpr float half_pi[] = {
+#ifdef YNN_HAVE_FMA
+    -1.57079637e+00f,
+    4.37113883e-08f,
+    1.71512451e-15f,
+#else
+    -1.57031250e+00f,
+    -4.83751297e-04f,
+    -7.54953362e-08f,
+    -2.56328292e-12f,
+    -6.12574227e-17f,
+#endif
+  };
+  x = range_reduce<IsCos, int32_t>(x, half_pi);
+
+  std::array<float, 6> P = {
+    -6.2255153921e-08f,
+    2.9789207474e-06f,
+    -1.9884618814e-04f,
+    8.3336085081e-03f,
+    -1.6666665673e-01f,
+    1.0000000000e+00f,
+  };
+  return internal::sin_impl(x, P);
+}
+
+template <bool IsCos, size_t N>
+static vec<double, N> sincos(vec<double, N> x) {
+  constexpr double half_pi[] = {
+#ifdef YNN_HAVE_FMA
+    -1.5707963267948966e+00,
+    -6.1232339957367660e-17,
+    1.4973849048591698e-33,
+#else
+    -1.5707963258028030e+00,
+    -9.9209357395935172e-10,
+    -5.7211887096635749e-18,
+    -1.6446256892965207e-26,
+    -4.3359050802648101e-35,
+#endif
+  };
+  x = range_reduce<IsCos, int64_t>(x, half_pi);
+
+  std::array<double, 10> P = {
+    -3.065453382825495475e-16,
+    8.116937876884829405e-15,
+    -8.003836194839132089e-13,
+    1.607132671211211221e-10,
+    -2.505234757550140162e-08,
+    2.755732190687408129e-06,
+    -1.984126985789365567e-04,
+    8.333333333383581218e-03,
+    -1.666666666666720142e-01,
+    1.000000000000000000e+00,
+  };
+  return internal::sin_impl(x, P);
+}
+
+}  // namespace internal
+
+template <typename T, size_t N>
+static vec<T, N> sin(vec<T, N> x) {
+  return internal::sincos</*IsCos=*/false>(x);
+}
+
+template <typename T, size_t N>
+static vec<T, N> cos(vec<T, N> x) {
+  return internal::sincos</*IsCos=*/true>(x);
 }
 
 }  // namespace simd

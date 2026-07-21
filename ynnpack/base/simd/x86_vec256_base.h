@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 #include <type_traits>
 
 #include "ynnpack/base/base.h"
@@ -725,6 +726,9 @@ YNN_ALWAYS_INLINE f16x16 operator-(f16x16 a) {
 #endif
 
 #ifdef YNN_ARCH_X86_AVX2
+YNN_ALWAYS_INLINE s64x4 operator+(s64x4 a, s64x4 b) {
+  return s64x4{_mm256_add_epi64(a.v, b.v)};
+}
 YNN_ALWAYS_INLINE s32x8 operator+(s32x8 a, s32x8 b) {
   return s32x8{_mm256_add_epi32(a.v, b.v)};
 }

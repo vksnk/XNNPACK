@@ -839,6 +839,9 @@ YNN_ALWAYS_INLINE f64x2 operator+(f64x2 a, f64x2 b) {
 YNN_ALWAYS_INLINE f32x4 operator+(f32x4 a, f32x4 b) {
   return f32x4{_mm_add_ps(a.v, b.v)};
 }
+YNN_ALWAYS_INLINE s64x2 operator+(s64x2 a, s64x2 b) {
+  return s64x2{_mm_add_epi64(a.v, b.v)};
+}
 YNN_ALWAYS_INLINE s32x4 operator+(s32x4 a, s32x4 b) {
   return s32x4{_mm_add_epi32(a.v, b.v)};
 }

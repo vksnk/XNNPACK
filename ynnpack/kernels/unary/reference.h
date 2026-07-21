@@ -474,7 +474,7 @@ struct sign : public unary_op_info {
 struct trig : public unary_op_info {
   explicit trig(const unary_params& = {}) {}
   tolerance_spec tolerance(ynn_type /*type*/) const override {
-    return tolerance_spec{/*relative=*/5.0f, /*absolute=*/3.0f};
+    return tolerance_spec{/*relative=*/5.0f};
   }
 
   interval domain(ynn_type type) const override { return {-100.0f, 100.0f}; }

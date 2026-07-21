@@ -226,7 +226,7 @@ auto make_unary_reduce_impl(const ynn_node::reduce& op, reduce_kernel kernel) {
 
     // The k1 kernel always works.
     reduce_kernel_fn kernel_fn = kernel.k1;
-    if (k1 == 1 && k2 != 1 && (n == 1 || a_stride_n == a.elem_size)) {
+    if (k1 == 1 && (n == 1 || a_stride_n == a.elem_size)) {
       // There is no reduction in the k1 dimension, and the n dimension is
       // contiguous in a, the kn kernel will be much faster.
       kernel_fn = kernel.kn;

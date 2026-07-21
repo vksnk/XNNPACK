@@ -2954,8 +2954,15 @@ static enum xnn_status reshape_dwconv(
       convolution_op->convolution_op->dilation_width == 1
           ? min(convolution_op->convolution_op->stride_width, kernel_width)
           : kernel_width;
-  const size_t step_height =
-      kernel_size + (output_width - 1) * step_width * kernel_height;
+  size_t step_height_increment = 0;
+  size_t step_height = 0;
+  if (!xnn_safe_mul(output_width - 1, step_width, &step_height_increment) ||
+      !xnn_safe_mul(step_height_increment, kernel_height, &step_height_increment) ||
+      !xnn_safe_add(kernel_size, step_height_increment, &step_height)) {
+    xnn_log_error("failed to reshape %s operator: step_height overflows size_t",
+                  xnn_operator_type_to_string_v2(convolution_op));
+    return xnn_status_out_of_memory;
+  }
   const struct xnn_ukernel_dwconv dwconv_ukernel =
       convolution_op->ukernel.dwconv;
   const size_t primary_tile = dwconv_ukernel.primary_tile;
@@ -2963,10 +2970,19 @@ static enum xnn_status reshape_dwconv(
 
   // Micro-kernel will read (tile_size - kernel_size) elements after the end of
   // indirection buffer.
+  size_t indirection_buffer_elements = 0;
+  size_t indirection_buffer_size_raw = 0;
+  if (!xnn_safe_mul(output_height, step_height, &indirection_buffer_elements) ||
+      !xnn_safe_add(primary_tile - kernel_size, indirection_buffer_elements,
+                    &indirection_buffer_elements) ||
+      !xnn_safe_mul(indirection_buffer_elements, sizeof(void*),
+                    &indirection_buffer_size_raw)) {
+    xnn_log_error("failed to reshape %s operator: indirection buffer size overflows size_t",
+                  xnn_operator_type_to_string_v2(convolution_op));
+    return xnn_status_out_of_memory;
+  }
   const size_t indirection_buffer_size =
-      round_up_po2(sizeof(void*) * (primary_tile - kernel_size +
-                                    output_height * step_height),
-                   XNN_ALLOCATION_ALIGNMENT);
+      round_up_po2(indirection_buffer_size_raw, XNN_ALLOCATION_ALIGNMENT);
 
   size_t dwconv_compute_index;
   const bool is_transient_indirection_buffer =

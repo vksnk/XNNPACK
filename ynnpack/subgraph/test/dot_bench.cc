@@ -244,6 +244,9 @@ int main(int argc, char** argv) {
       thread_count = std::stoi(argv[i] + 15);
       std::copy(argv + i + 1, argv + argc, argv + i);
       argc -= 1;
+    } else if (strncmp(argv[i], "--benchmark_", 12) == 0 ||
+               strncmp(argv[i], "-benchmark_", 11) == 0) {
+      i++;
     } else {
       usage(argv[0]);
       return -1;

@@ -33,12 +33,16 @@ namespace ynn {
 namespace {
 
 // Call a unary kernel.
-auto make_unary_elementwise_impl(unary_kernel_fn kernel, unary_params params) {
-  return [kernel, params](slinky::raw_buffer a,
-                          slinky::raw_buffer x) -> slinky::index_t {
+auto make_unary_elementwise_impl(unary_kernel_fn kernel, unary_params params,
+                                 ynn_type a_type, ynn_type x_type) {
+  const int a_elem_count = type_element_count(a_type);
+  const int x_elem_count = type_element_count(x_type);
+  return [kernel, params, a_elem_count, x_elem_count](
+             slinky::raw_buffer a, slinky::raw_buffer x) -> slinky::index_t {
     slinky::dim a_dims[2], x_dims[2];
 
-    if (!fuse_and_slice_leading_dims<2>(&x_dims[0], x, &a_dims[0], a)) {
+    if (!fuse_and_slice_leading_dims<2>(&x_dims[0], x_elem_count, x, &a_dims[0],
+                                        a_elem_count, a)) {
       return 0;
     }
 
@@ -209,22 +213,11 @@ ynn_status create_unary(const ynn_node& node, ynn_runtime& runtime,
   attrs.allow_in_place = compute_allow_in_place(node, *runtime.subgraph);
 
   slinky::func func = slinky::func::make(
-      make_unary_elementwise_impl(kernel, params),
+      make_unary_elementwise_impl(kernel, params, a.type, x.type),
       {{a.buffer, std::move(bounds)}}, {{x.buffer, dims}}, std::move(attrs));
 
-  std::vector<slinky::expr> given_splits = {};
-  // We don't want to split the innermost dimension if the type of the input is
-  // sub-byte.
-  if (type_element_count(a.type) > type_element_count(x.type)) {
-    given_splits.push_back(slinky::max(1, x.physical_extent(0)));
-  }
-  auto sched = runtime.make_schedule(dims, x.physical_extents(),
-                                     x.buffer->elem_size(), given_splits);
-
-  if (sched && !sched->loop_splits.empty() &&
-      type_element_count(a.type) > type_element_count(x.type)) {
-    sched->loop_splits[0].step_is_required = true;
-  }
+  auto sched = runtime.make_schedule(
+      dims, x.physical_extents(), x.buffer->elem_size());
 
   func.user_data() = sched.get();
   runtime.scheduling_info_storage.push_back(std::move(sched));
