@@ -523,29 +523,36 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
   }
 
   if (op != ynn_reduce_min_max) {
-    // Give the reduction dimensions the first claim on the tile area: a
-    // partial reduction is only worth creating when a reduction dimension
-    // doesn't fit in a tile, so the kept dimensions must not starve it of the
-    // budget.
-    std::vector<int> budget_order;
-    for (int i = 0; i < a.rank(); ++i) {
-      if (k_dims[i]) budget_order.push_back(i);
-    }
-    for (int i = 0; i < a.rank(); ++i) {
-      if (!k_dims[i]) budget_order.push_back(i);
-    }
-    // Keep the split of the innermost dimension a multiple of the vector width
-    // so its tiles don't degenerate to scalar-width columns when another
-    // dimension takes most of the tile area.
+    // Reserve a minimal split for the dimensions that must not be starved of
+    // the tile area, while the dimensions are visited innermost-first so the
+    // tiles stay dense in memory:
+    // - the innermost dimension reserves a vector width, so its split doesn't
+    //   collapse to scalar-width columns;
+    // - the reduction dimensions reserve enough that the *product* of the
+    //   reduction chunks in a tile amortizes the accumulator traffic, because
+    //   a partial reduction with a tiny combined reduction step is just an
+    //   expensive copy of the input. Reduction dimensions below already
+    //   contribute their guaranteed chunk to the product, so outer reduction
+    //   dimensions only reserve what's missing.
     // TODO(vksnk): Take the vector width from the kernel instead of assuming
     // 64 bytes.
     const size_t elem_size = type_size_bytes(a.type);
-    std::vector<slinky::expr> alignments = {slinky::expr(
-        elem_size > 0 && elem_size < 64 ? 64 / (slinky::index_t)elem_size
-                                        : 1)};
+    std::vector<slinky::expr> alignments(a.rank());
+    alignments[0] = slinky::expr(
+        elem_size > 0 && elem_size < 64 ? 64 / (slinky::index_t)elem_size : 1);
+    slinky::expr k_chunk_below = 1;
+    for (int i = 0; i < a.rank(); ++i) {
+      if (!k_dims[i]) continue;
+      if (i > 0) {
+        alignments[i] = slinky::simplify(slinky::max(
+            1, slinky::ceil_div(slinky::expr(256), k_chunk_below)));
+      }
+      k_chunk_below = slinky::simplify(
+          k_chunk_below * slinky::min(alignments[i], a.extents[i]));
+    }
     std::vector<slinky::expr> split_factors = make_split_factors(
         subgraph->globals, a.extents, type_size_bytes(a.type),
-        /*given_splits=*/{}, budget_order, alignments);
+        /*given_splits=*/{}, /*loop_order=*/{}, alignments);
 
     // We should only do a partial reduction if we can prove that a dimension is
     // split. If needed, we could add a flag that would indicate we should
