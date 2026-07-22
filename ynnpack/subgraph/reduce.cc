@@ -483,6 +483,10 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
       validate_output_tensor("reduce", subgraph, "output_id", output_id));
 
   const ynn_value* a_ptr = &subgraph->value(input_a_id);
+  // The type the input is stored as. Sub-byte inputs may be promoted below,
+  // but the (fused) convert still reads the stored input, so byte-density
+  // derived floors must be computed from this type, not the promoted one.
+  const ynn_type stored_type = a_ptr->type;
   ynn_type target_accumulator_type = get_accumulator_type(op, a_ptr->type);
   reduce_kernel kernel =
       get_reduce_kernel(op, a_ptr->type, target_accumulator_type);
@@ -526,8 +530,12 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
     // Reserve a minimal split for the dimensions that must not be starved of
     // the tile area, while the dimensions are visited innermost-first so the
     // tiles stay dense in memory:
-    // - the innermost dimension reserves a vector width, so its split doesn't
-    //   collapse to scalar-width columns;
+    // - the innermost dimension reserves a vector width of the *stored* input
+    //   (a fused sub-byte convert reads the packed input, so the byte density
+    //   comes from the stored type), so its split doesn't collapse to
+    //   scalar-width columns;
+    // - the kept dimensions forming the contiguous prefix reserve enough that
+    //   the reads of the stored input stay at least ~256 bytes long;
     // - the reduction dimensions reserve enough that the *product* of the
     //   reduction chunks in a tile amortizes the accumulator traffic, because
     //   a partial reduction with a tiny combined reduction step is just an
@@ -536,10 +544,25 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
     //   dimensions only reserve what's missing.
     // TODO(vksnk): Take the vector width from the kernel instead of assuming
     // 64 bytes.
-    const size_t elem_size = type_size_bytes(a.type);
+    const size_t stored_size = std::max<size_t>(1, type_size_bytes(stored_type));
+    const slinky::index_t elems_per_64b = std::max<size_t>(
+        1, 64 * type_element_count(stored_type) / stored_size);
     std::vector<slinky::expr> alignments(a.rank());
-    alignments[0] = slinky::expr(
-        elem_size > 0 && elem_size < 64 ? 64 / (slinky::index_t)elem_size : 1);
+    alignments[0] = slinky::expr(elems_per_64b);
+    if (!k_dims[0]) {
+      // The reduce (and sub-byte unpack) kernels are much more efficient on
+      // long fused rows, so target rows of ~1KB of the stored input.
+      slinky::expr prefix = slinky::min(alignments[0], a.extents[0]);
+      for (int i = 1; i < a.rank() && !k_dims[i]; ++i) {
+        alignments[i] = slinky::simplify(slinky::max(
+            1, slinky::ceil_div(slinky::expr(16 * elems_per_64b), prefix)));
+        prefix = slinky::simplify(prefix *
+                                  slinky::min(alignments[i], a.extents[i]));
+      }
+    }
+    // The 256-element reduction chunk keeps the accumulator traffic a small
+    // fraction of the input traffic, and also lets a reduction dimension that
+    // fits in a tile reach its full extent (no partial reduction at all).
     slinky::expr k_chunk_below = 1;
     for (int i = 0; i < a.rank(); ++i) {
       if (!k_dims[i]) continue;
