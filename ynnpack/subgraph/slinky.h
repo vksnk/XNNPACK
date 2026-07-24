@@ -123,7 +123,10 @@ slinky::box_expr make_broadcast_bounds(
 // positional vector (undefined entries mean no alignment): a dimension with an
 // alignment gets a split that is a multiple of it, and at least one
 // alignment-sized block is reserved for it before the remaining area is
-// distributed between the other dimensions.
+// distributed between the other dimensions. Alignments must not exceed the
+// corresponding extents (callers should clamp them), otherwise the computed
+// split exceeds the extent and the reservation wastes area the dimension
+// can't use.
 std::vector<slinky::expr> make_split_factors(
     ynn::slinky_globals& globals, ynn::span<const slinky::expr> extents,
     const slinky::expr& element_cost,

@@ -227,12 +227,9 @@ std::vector<slinky::expr> make_split_factors(
     return index_d < loop_order.size() ? loop_order[index_d] : index_d;
   };
 
-  // The effective alignment of a dimension. A dimension never uses more than
-  // its extent of the area, so the reservation is capped by the extent to
-  // avoid setting aside area the dimension can't use.
   auto alignment_of = [&](int d) {
     if (d < alignments.size() && alignments[d].defined()) {
-      return slinky::simplify(slinky::min(alignments[d], extents[d]));
+      return alignments[d];
     }
     return slinky::expr(1);
   };

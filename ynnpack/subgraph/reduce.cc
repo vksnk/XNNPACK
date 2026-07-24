@@ -547,17 +547,21 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
     const size_t stored_size = std::max<size_t>(1, type_size_bytes(stored_type));
     const slinky::index_t elems_per_64b = std::max<size_t>(
         1, 64 * type_element_count(stored_type) / stored_size);
+    // Alignments passed to make_split_factors must not exceed the extents, so
+    // every floor below is clamped by the extent of its dimension.
     std::vector<slinky::expr> alignments(a.rank());
-    alignments[0] = slinky::expr(elems_per_64b);
+    alignments[0] =
+        slinky::simplify(slinky::min(elems_per_64b, a.extents[0]));
     if (!k_dims[0]) {
       // The reduce (and sub-byte unpack) kernels are much more efficient on
       // long fused rows, so target rows of ~1KB of the stored input.
-      slinky::expr prefix = slinky::min(alignments[0], a.extents[0]);
+      slinky::expr prefix = alignments[0];
       for (int i = 1; i < a.rank() && !k_dims[i]; ++i) {
-        alignments[i] = slinky::simplify(slinky::max(
-            1, slinky::ceil_div(slinky::expr(16 * elems_per_64b), prefix)));
-        prefix = slinky::simplify(prefix *
-                                  slinky::min(alignments[i], a.extents[i]));
+        alignments[i] = slinky::simplify(slinky::min(
+            slinky::max(
+                1, slinky::ceil_div(slinky::expr(16 * elems_per_64b), prefix)),
+            a.extents[i]));
+        prefix = slinky::simplify(prefix * alignments[i]);
       }
     }
     // The 256-element reduction chunk keeps the accumulator traffic a small
@@ -567,11 +571,11 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
     for (int i = 0; i < a.rank(); ++i) {
       if (!k_dims[i]) continue;
       if (i > 0) {
-        alignments[i] = slinky::simplify(slinky::max(
-            1, slinky::ceil_div(slinky::expr(256), k_chunk_below)));
+        alignments[i] = slinky::simplify(slinky::min(
+            slinky::max(1, slinky::ceil_div(slinky::expr(256), k_chunk_below)),
+            a.extents[i]));
       }
-      k_chunk_below = slinky::simplify(
-          k_chunk_below * slinky::min(alignments[i], a.extents[i]));
+      k_chunk_below = slinky::simplify(k_chunk_below * alignments[i]);
     }
     std::vector<slinky::expr> split_factors = make_split_factors(
         subgraph->globals, a.extents, type_size_bytes(a.type),

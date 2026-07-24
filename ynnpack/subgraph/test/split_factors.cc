@@ -74,15 +74,17 @@ TEST(MakeSplitFactors, SplitIsMultipleOfAlignment) {
   EXPECT_EQ(constant(splits[0]), kTileArea / (16 * 3) * 16);
 }
 
-TEST(MakeSplitFactors, ReservationIsCappedByExtent) {
+TEST(MakeSplitFactors, ExtentSizedAlignmentReservesWholeDimension) {
   slinky_globals globals;
   std::vector<slinky::expr> extents = {4, 65536};
   std::vector<int> order = {1, 0};
-  std::vector<slinky::expr> alignments = {16};
+  // Alignments must not exceed the extents; callers clamp them (here 4 stands
+  // for a vector-width floor clamped by the extent of 4).
+  std::vector<slinky::expr> alignments = {4};
   std::vector<slinky::expr> splits = make_split_factors(
       globals, extents, kElementCost, /*given_splits=*/{}, order, alignments);
   // Dimension 0 can only ever use 4 elements of the area, so its reservation
-  // must not shrink dimension 1's share by the full alignment.
+  // must not shrink dimension 1's share by more than that.
   EXPECT_EQ(constant(splits[1]), kTileArea / 4);
   EXPECT_EQ(constant(splits[0]), 4);
 }
