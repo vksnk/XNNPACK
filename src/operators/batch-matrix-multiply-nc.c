@@ -974,14 +974,25 @@ reshape_batch_matrix_multiply_nc(
                   extra_weights_bytes)
             : (k_stride << log2_input_b_element_size) + bias_element_size +
                 extra_weights_bytes;
-    const size_t input_b_batch_stride = n_stride * weights_stride;
+    size_t input_b_batch_stride = 0;
+    if (!xnn_safe_mul(n_stride, weights_stride, &input_b_batch_stride)) {
+      xnn_log_error(
+          "failed to reshape %s operator: batch stride overflows size_t",
+          xnn_operator_type_to_string_v2(batch_matrix_multiply_op));
+      return xnn_status_out_of_memory;
+    }
 
     // Store the computed weights stride in the op for later use.
     batch_matrix_multiply_op->weights_stride = weights_stride;
 
     // Compute the required workspace size.
     if (workspace_size != NULL) {
-      *workspace_size = batch_size_b * input_b_batch_stride;
+      if (!xnn_safe_mul(batch_size_b, input_b_batch_stride, workspace_size)) {
+        xnn_log_error(
+            "failed to reshape %s operator: workspace size overflows size_t",
+            xnn_operator_type_to_string_v2(batch_matrix_multiply_op));
+        return xnn_status_out_of_memory;
+      }
     }
     xnn_log_debug("Requesting workspace of size %zu for packed weights.",
                   *workspace_size);
