@@ -527,52 +527,58 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
   }
 
   if (op != ynn_reduce_min_max) {
-    // Reserve a minimal split for the dimensions that must not be starved of
-    // the tile area, while the dimensions are visited innermost-first so the
-    // tiles stay dense in memory:
-    // - the innermost dimension reserves a vector width of the *stored* input
-    //   (a fused sub-byte convert reads the packed input, so the byte density
-    //   comes from the stored type), so its split doesn't collapse to
-    //   scalar-width columns;
-    // - the kept dimensions forming the contiguous prefix reserve enough that
-    //   the reads of the stored input stay at least ~256 bytes long;
-    // - the reduction dimensions reserve enough that the *product* of the
-    //   reduction chunks in a tile amortizes the accumulator traffic, because
-    //   a partial reduction with a tiny combined reduction step is just an
-    //   expensive copy of the input. Reduction dimensions below already
-    //   contribute their guaranteed chunk to the product, so outer reduction
-    //   dimensions only reserve what's missing.
-    // TODO(vksnk): Take the vector width from the kernel instead of assuming
-    // 64 bytes.
+    // make_split_factors hands out the tile area innermost-first, so an early
+    // large dimension can consume all of it and leave later dimensions with a
+    // split of 1. Guard against that with two reservation floors (alignments),
+    // both counted in the *stored* type: a sub-byte input is promoted, but
+    // the promoting convert fuses into the reduction loops and reads the
+    // packed stored input, so byte-derived floors must use its density, not
+    // the promoted one.
+
+    // A tile is read as contiguous rows: dimension 0's split, extended by the
+    // kept dimensions above it while their extents are covered whole. Short
+    // rows are dominated by per-row kernel startup, which is especially
+    // expensive for the sub-byte unpack (measured on 9900X: reducing the
+    // outer dimension of 1024x4096x64 int2 is 2.3x slower with 128-byte rows
+    // than with 1KB rows, and of 1024x16x16384 int8 1.7x slower with 64-byte
+    // rows).
+    constexpr slinky::index_t row_target_bytes = 1024;
+    // Each tile must reduce at least this many elements, as the *product* of
+    // its reduction-dimension chunks, so writing out the partial accumulators
+    // is amortized: with a chunk of 1 the "partial reduction" is just an
+    // expensive copy of the input (up to 43x slower on 1024x1024x256 int2,
+    // outer dimension reduced). This floor is also what lets a reduction
+    // dimension small enough to fit in the tile reach its full extent, so no
+    // partial reduction is created at all.
+    constexpr slinky::index_t min_reduction_elems = 256;
+
     const size_t stored_size = std::max<size_t>(1, type_size_bytes(stored_type));
-    const slinky::index_t elems_per_64b = std::max<size_t>(
-        1, 64 * type_element_count(stored_type) / stored_size);
+    const slinky::index_t row_elems = std::max<size_t>(
+        1, row_target_bytes * type_element_count(stored_type) / stored_size);
     // Alignments passed to make_split_factors must not exceed the extents, so
     // every floor below is clamped by the extent of its dimension.
     std::vector<slinky::expr> alignments(a.rank());
-    alignments[0] =
-        slinky::simplify(slinky::min(elems_per_64b, a.extents[0]));
+    alignments[0] = slinky::simplify(slinky::min(row_elems, a.extents[0]));
     if (!k_dims[0]) {
-      // The reduce (and sub-byte unpack) kernels are much more efficient on
-      // long fused rows, so target rows of ~1KB of the stored input.
+      // Dimension 0 reserves the whole row target; each kept dimension of the
+      // contiguous prefix above it only reserves the factor still missing.
       slinky::expr prefix = alignments[0];
       for (int i = 1; i < a.rank() && !k_dims[i]; ++i) {
         alignments[i] = slinky::simplify(slinky::min(
-            slinky::max(
-                1, slinky::ceil_div(slinky::expr(16 * elems_per_64b), prefix)),
+            slinky::max(1, slinky::ceil_div(slinky::expr(row_elems), prefix)),
             a.extents[i]));
         prefix = slinky::simplify(prefix * alignments[i]);
       }
     }
-    // The 256-element reduction chunk keeps the accumulator traffic a small
-    // fraction of the input traffic, and also lets a reduction dimension that
-    // fits in a tile reach its full extent (no partial reduction at all).
+    // Reduction dimensions below already guarantee part of the product, so an
+    // outer reduction dimension only reserves the missing factor.
     slinky::expr k_chunk_below = 1;
     for (int i = 0; i < a.rank(); ++i) {
       if (!k_dims[i]) continue;
       if (i > 0) {
         alignments[i] = slinky::simplify(slinky::min(
-            slinky::max(1, slinky::ceil_div(slinky::expr(256), k_chunk_below)),
+            slinky::max(1, slinky::ceil_div(slinky::expr(min_reduction_elems),
+                                            k_chunk_below)),
             a.extents[i]));
       }
       k_chunk_below = slinky::simplify(k_chunk_below * alignments[i]);
