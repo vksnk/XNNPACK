@@ -168,6 +168,7 @@ INCLUDE_DIRECTORIES(.)
 
 # ---[ Subdirectories.
 ADD_SUBDIRECTORY(base)
+ADD_SUBDIRECTORY(composites)
 ADD_SUBDIRECTORY(kernels)
 ADD_SUBDIRECTORY(subgraph)
 ADD_SUBDIRECTORY(xnnpack)

@@ -294,6 +294,7 @@ cc_test(
         ":scheduler",
         "//ynnpack",
         "//ynnpack/base",
+        "//ynnpack/base/test:util",
         "@com_google_benchmark//:benchmark",
     ],
 )

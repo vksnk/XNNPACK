@@ -673,6 +673,22 @@ YNN_ALWAYS_INLINE s8x64 operator~(s8x64 a) {
   return s8x64{_mm512_xor_si512(a.v, _mm512_set1_epi32(-1))};
 }
 
+YNN_ALWAYS_INLINE s64x8 operator&(s64x8 a, s64x8 b) {
+  return s64x8{_mm512_and_si512(a.v, b.v)};
+}
+YNN_ALWAYS_INLINE s64x8 operator|(s64x8 a, s64x8 b) {
+  return s64x8{_mm512_or_si512(a.v, b.v)};
+}
+YNN_ALWAYS_INLINE s64x8 operator^(s64x8 a, s64x8 b) {
+  return s64x8{_mm512_xor_si512(a.v, b.v)};
+}
+YNN_ALWAYS_INLINE s64x8 operator<<(s64x8 a, int b) {
+  return s64x8{_mm512_slli_epi64(a.v, b)};
+}
+YNN_ALWAYS_INLINE s64x8 operator~(s64x8 a) {
+  return s64x8{_mm512_xor_si512(a.v, _mm512_set1_epi64(-1))};
+}
+
 YNN_ALWAYS_INLINE f64x8 fma(f64x8 a, f64x8 b, f64x8 acc) {
   return f64x8{_mm512_fmadd_pd(a.v, b.v, acc.v)};
 }
@@ -933,6 +949,25 @@ YNN_ALWAYS_INLINE __mmask8 isinf(f64x8 a) {
 }
 YNN_ALWAYS_INLINE __mmask8 isfinite(f64x8 a) {
   return ~_mm512_fpclass_pd_mask(a.v, 0x99);
+}
+
+YNN_ALWAYS_INLINE __mmask8 operator==(s64x8 a, s64x8 b) {
+  return _mm512_cmpeq_epi64_mask(a.v, b.v);
+}
+YNN_ALWAYS_INLINE __mmask8 operator!=(s64x8 a, s64x8 b) {
+  return _mm512_cmpneq_epi64_mask(a.v, b.v);
+}
+YNN_ALWAYS_INLINE __mmask8 operator<(s64x8 a, s64x8 b) {
+  return _mm512_cmplt_epi64_mask(a.v, b.v);
+}
+YNN_ALWAYS_INLINE __mmask8 operator<=(s64x8 a, s64x8 b) {
+  return _mm512_cmple_epi64_mask(a.v, b.v);
+}
+YNN_ALWAYS_INLINE __mmask8 operator>(s64x8 a, s64x8 b) {
+  return _mm512_cmpgt_epi64_mask(a.v, b.v);
+}
+YNN_ALWAYS_INLINE __mmask8 operator>=(s64x8 a, s64x8 b) {
+  return _mm512_cmpge_epi64_mask(a.v, b.v);
 }
 
 YNN_ALWAYS_INLINE __mmask16 operator==(s32x16 a, s32x16 b) {

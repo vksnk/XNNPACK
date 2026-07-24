@@ -171,7 +171,7 @@ print_polynomial("p", p)
 # expm1(x) ~= x + x^2 * (P(x)/Q(x))
 x_test = np.linspace(x_min, x_max, 5000)
 approx = x_test**2 * poly_eval(p, x_test) + x_test
-plot_error(np.expm1, x_test, approx, epsilon=2**-24)
+plot_error(np.expm1, x_test, approx, epsilon=2**-23)
 
 # %%
 # fp64 expm1
@@ -229,7 +229,7 @@ print_polynomial("Q", q)
 # Evaluate final error
 x_test = np.linspace(x_min, x_max, 5000)
 approx = x_test**2 * poly_eval(p, x_test) / poly_eval(q, x_test) + x_test
-plot_error(np.log1p, x_test, approx, epsilon=2**-24)
+plot_error(np.log1p, x_test, approx, epsilon=2**-23)
 
 # %%
 import math
@@ -308,7 +308,7 @@ plot_error(
     x_test,
     approx,
     title="Relative Error for erf(x) (Odd Approximation)",
-    epsilon=2**-24,
+    epsilon=2**-23,
 )
 
 # %%
@@ -344,7 +344,7 @@ plot_error(
     x_test,
     approx,
     title=f"Refined 3-Piece erf (P={p_deg}, Q={q_deg}, R={r_deg})",
-    epsilon=2**-24,
+    epsilon=2**-23,
 )
 
 print("Final Optimized 3-Piece Coefficients:")
@@ -449,7 +449,7 @@ plot_error(
     x_test,
     approx,
     title="Odd tanh(x) Relative Error (fp32)",
-    epsilon=2**-24,
+    epsilon=2**-23,
 )
 
 # %%
@@ -501,12 +501,17 @@ def g(t):
     return np.where(sq == 0, 1.0, np.sin(sq) / sq)
 
 
-p_degree, q_degree = 5, 0
+p_degree, q_degree = 4, 0
 t_min, t_max = 1e-20, (np.pi / 2) ** 2
 
 p, q = rational_approximation(
-    g, t_min, t_max, p_degree, q_degree, dtype=np.float32
+    g, t_min, t_max, p_degree, q_degree, dtype=np.float64
 )
+
+# In this case, we get a better result by computing the polynomial in fp64, and
+# rounding the result.
+p = p.astype(np.float32)
+q = q.astype(np.float32)
 
 print_polynomial("P", p)
 print_polynomial("Q", q)
@@ -521,15 +526,15 @@ constants = split(half_pi, 5, 11, np.float32)
 print(f"""
   constexpr float half_pi[] = {{
 #ifdef YNN_HAVE_FMA
-    {fma_constants[0]:.8e}f,
-    {fma_constants[1]:.8e}f,
-    {fma_constants[2]:.8e}f,
+      {fma_constants[0]:.8e}f,
+      {fma_constants[1]:.8e}f,
+      {fma_constants[2]:.8e}f,
 #else
-    {constants[0]:.8e}f,
-    {constants[1]:.8e}f,
-    {constants[2]:.8e}f,
-    {constants[3]:.8e}f,
-    {constants[4]:.8e}f,
+      {constants[0]:.8e}f,
+      {constants[1]:.8e}f,
+      {constants[2]:.8e}f,
+      {constants[3]:.8e}f,
+      {constants[4]:.8e}f,
 #endif
   }};
 """)
@@ -539,7 +544,13 @@ x_test = np.linspace(-np.pi / 2, np.pi / 2, 5000)
 t_test = x_test**2
 approx = x_test * (poly_eval(p, t_test) / poly_eval(q, t_test))
 
-plot_error(np.sin, x_test, approx, title="Relative Error for sin(x * pi/2)")
+plot_error(
+    np.sin,
+    x_test,
+    approx,
+    title="Relative Error for sin(x * pi/2)",
+    epsilon=2**-23,
+)
 
 
 # %%
@@ -549,8 +560,8 @@ def g(t):
     return np.where(sq == 0, 1.0, np.sin(sq) / sq)
 
 
-p_degree, q_degree = 9, 0
-t_min, t_max = 1e-20, (np.pi / 2) ** 2
+p_degree, q_degree = 8, 0
+t_min, t_max = 1e-4, (np.pi / 2) ** 2
 
 p, q = rational_approximation(
     g, t_min, t_max, p_degree, q_degree, dtype=np.float64
@@ -569,15 +580,15 @@ constants = split(half_pi, 5, 27, np.float64)
 print(f"""
   constexpr double half_pi[] = {{
 #ifdef YNN_HAVE_FMA
-    {fma_constants[0]:.16e},
-    {fma_constants[1]:.16e},
-    {fma_constants[2]:.16e},
+      {fma_constants[0]:.16e},
+      {fma_constants[1]:.16e},
+      {fma_constants[2]:.16e},
 #else
-    {constants[0]:.16e},
-    {constants[1]:.16e},
-    {constants[2]:.16e},
-    {constants[3]:.16e},
-    {constants[4]:.16e},
+      {constants[0]:.16e},
+      {constants[1]:.16e},
+      {constants[2]:.16e},
+      {constants[3]:.16e},
+      {constants[4]:.16e},
 #endif
   }};
 """)
@@ -587,4 +598,10 @@ x_test = np.linspace(-np.pi / 2, np.pi / 2, 5000)
 t_test = x_test**2
 approx = x_test * (poly_eval(p, t_test) / poly_eval(q, t_test))
 
-plot_error(np.sin, x_test, approx, title="Relative Error for sin(x * pi/2)")
+plot_error(
+    np.sin,
+    x_test,
+    approx,
+    title="Relative Error for sin(x * pi/2)",
+    epsilon=2**-53,
+)

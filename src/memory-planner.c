@@ -105,10 +105,6 @@ static size_t find_value_alloc_offset(struct memory_block* live_mem_blocks,
     return 0;
   }
 
-  if (num_mem_blocks == 1) {
-    return live_mem_blocks[0].end;
-  }
-
   // Sort memory blocks according to 'start' in increasing order.
   qsort(live_mem_blocks, num_mem_blocks, sizeof(struct memory_block), cmp_memory_block);
 
@@ -130,17 +126,20 @@ static size_t find_value_alloc_offset(struct memory_block* live_mem_blocks,
   }
 
   size_t smallest_gap_size = SIZE_MAX;
-  // The first index to live_mem_blocks that the 'to_alloc_size' should be allocated after.
-  size_t smallest_gap_index = num_coalesced_mem_blocks - 1;
+  size_t alloc_offset = live_mem_blocks[num_coalesced_mem_blocks - 1].end;
+  if (live_mem_blocks[0].start >= to_alloc_size) {
+    smallest_gap_size = live_mem_blocks[0].start;
+    alloc_offset = 0;
+  }
   for (size_t i = 0; i < num_coalesced_mem_blocks - 1; ++i) {
     assert(live_mem_blocks[i + 1].start > live_mem_blocks[i].end);
     const size_t gap = live_mem_blocks[i + 1].start - live_mem_blocks[i].end;
     if (gap >= to_alloc_size && gap < smallest_gap_size) {
-      smallest_gap_index = i;
       smallest_gap_size = gap;
+      alloc_offset = live_mem_blocks[i].end;
     }
   }
-  return live_mem_blocks[smallest_gap_index].end;
+  return alloc_offset;
 }
 
 void xnn_init_value_allocation_tracker(

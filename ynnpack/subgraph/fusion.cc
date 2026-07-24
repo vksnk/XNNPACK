@@ -150,7 +150,7 @@ bool replace_uses(subgraph_analysis& analysis, ynn_subgraph& subgraph,
   }
 }
 
-// Rewrite divide(x, sqrt(y)) to multiply(x, reciprocal_square_root(y))
+// Rewrite divide(x, sqrt(y)) to multiply(x, rsqrt(y))
 bool rewrite_divide_sqrt(ynn_subgraph& subgraph, ynn_node& node,
                          subgraph_analysis& analysis) {
   if (!is_binary_node(node, ynn_binary_divide)) {
@@ -158,7 +158,7 @@ bool rewrite_divide_sqrt(ynn_subgraph& subgraph, ynn_node& node,
   }
 
   ynn_node* producer = analysis.producer_of(node.inputs[1]);
-  if (!producer || !is_unary_node(*producer, ynn_unary_square_root)) {
+  if (!producer || !is_unary_node(*producer, ynn_unary_sqrt)) {
     // The denominator of the divide is not a square root.
     return false;
   }
@@ -175,15 +175,15 @@ bool rewrite_divide_sqrt(ynn_subgraph& subgraph, ynn_node& node,
   const ynn_value& y = subgraph.value(producer->inputs[0]);
   const ynn_value& output = subgraph.value(node.outputs[0]);
 
-  const ynn::unary_kernel_fn rsqrt_kernel = ynn::get_unary_kernel(
-      ynn_unary_reciprocal_square_root, y.type, sqrt_y.type);
+  const ynn::unary_kernel_fn rsqrt_kernel =
+      ynn::get_unary_kernel(ynn_unary_rsqrt, y.type, sqrt_y.type);
   const ynn::binary_kernel_fn multiply_kernel = ynn::get_binary_kernel(
       ynn_binary_multiply, x.type, sqrt_y.type, output.type);
 
   if (rsqrt_kernel != nullptr && multiply_kernel != nullptr) {
     YNN_LOG_DEBUG() << "Rewriting x/sqrt(y) to x*rsqrt(y)";
     ynn::define_unary(subgraph, *producer, y.id, sqrt_y.id,
-                      ynn_unary_reciprocal_square_root, rsqrt_kernel);
+                      ynn_unary_rsqrt, rsqrt_kernel);
     ynn::define_binary(subgraph, node, x.id, sqrt_y.id, output.id,
                        ynn_binary_multiply, multiply_kernel);
     return true;
@@ -1444,8 +1444,8 @@ bool fold_unary_output(ynn_subgraph& subgraph, ynn_node& node,
     case ynn_unary_approx_erf:
     case ynn_unary_tanh:
     case ynn_unary_approx_tanh:
-    case ynn_unary_sine:
-    case ynn_unary_cosine:
+    case ynn_unary_sin:
+    case ynn_unary_cos:
     case ynn_unary_poly3:
       break;
     default:
