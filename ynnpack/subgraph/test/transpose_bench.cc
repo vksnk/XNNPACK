@@ -17,8 +17,6 @@
 #include <vector>
 
 #include "ynnpack/base/base.h"
-#include "ynnpack/base/bfloat16.h"
-#include "ynnpack/base/fp8.h"
 #include "ynnpack/base/half.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/include/ynnpack.h"
@@ -154,45 +152,24 @@ void bench(benchmark::State& state, ynn_threadpool_t threadpool, int dim0,
 }
 
 template <typename Fn>
-bool switch_type(ynn_type type, Fn&& fn) {
-  switch (type) {
-    case ynn_type_int2:
+bool switch_bits(int bits, Fn&& fn) {
+  switch (bits) {
+    case 2:
       fn(int2x4());
       return true;
-    case ynn_type_uint2:
-      fn(uint2x4());
-      return true;
-    case ynn_type_int4:
+    case 4:
       fn(int4x2());
       return true;
-    case ynn_type_uint4:
-      fn(uint4x2());
-      return true;
-    case ynn_type_int8:
+    case 8:
       fn(int8_t());
       return true;
-    case ynn_type_uint8:
-      fn(uint8_t());
-      return true;
-    case ynn_type_int32:
-      fn(int32_t());
-      return true;
-    case ynn_type_fp8_e5m2:
-      fn(fp8_e5m2());
-      return true;
-    case ynn_type_fp8_e4m3:
-      fn(fp8_e4m3());
-      return true;
-    case ynn_type_fp16:
+    case 16:
       fn(half());
       return true;
-    case ynn_type_bf16:
-      fn(bfloat16());
-      return true;
-    case ynn_type_fp32:
+    case 32:
       fn(float());
       return true;
-    case ynn_type_fp64:
+    case 64:
       fn(double());
       return true;
     default:
@@ -200,13 +177,13 @@ bool switch_type(ynn_type type, Fn&& fn) {
   }
 }
 
-void bench(benchmark::State& state, ynn_threadpool_t threadpool, ynn_type type,
+void bench(benchmark::State& state, ynn_threadpool_t threadpool, int bits,
            int dim0, int dim1, int dim2, const std::array<int, 3>& perm) {
-  bool ok = switch_type(type, [&](auto type_val) {
+  bool ok = switch_bits(bits, [&](auto type_val) {
     bench<decltype(type_val)>(state, threadpool, dim0, dim1, dim2, perm);
   });
   if (!ok) {
-    state.SkipWithError("Unsupported type");
+    state.SkipWithError("Unsupported bit width");
   }
 }
 
@@ -214,27 +191,16 @@ void bench(benchmark::State& state, ynn_threadpool_t threadpool, ynn_type type,
 
 int parse(const char* str, int) { return std::stoi(str); }
 
-ynn_type parse(const char* str, ynn_type) {
-  if (strcmp(str, "int2") == 0) return ynn_type_int2;
-  if (strcmp(str, "uint2") == 0) return ynn_type_uint2;
-  if (strcmp(str, "int4") == 0) return ynn_type_int4;
-  if (strcmp(str, "uint4") == 0) return ynn_type_uint4;
-  if (strcmp(str, "int8") == 0) return ynn_type_int8;
-  if (strcmp(str, "uint8") == 0) return ynn_type_uint8;
-  if (strcmp(str, "int32") == 0) return ynn_type_int32;
-  if (strcmp(str, "fp8_e5m2") == 0) return ynn_type_fp8_e5m2;
-  if (strcmp(str, "fp8_e4m3") == 0) return ynn_type_fp8_e4m3;
-  if (strcmp(str, "fp16") == 0) return ynn_type_fp16;
-  if (strcmp(str, "bf16") == 0) return ynn_type_bf16;
-  if (strcmp(str, "fp32") == 0) return ynn_type_fp32;
-  if (strcmp(str, "fp64") == 0) return ynn_type_fp64;
-  return ynn_type_invalid;
-}
+std::string parse(const char* str, std::string) { return std::string(str); }
 
-// A permutation is a digit string over the axes (e.g. "021"), encoded as a
-// decimal int (leading zeros are fine: "021" -> 21).
-bool decode_perm(int encoded, std::array<int, 3>& perm) {
-  perm = {(encoded / 100) % 10, (encoded / 10) % 10, encoded % 10};
+// Verifies that a permutation string has exactly 3 digits and is a valid
+// permutation over axes 0, 1, 2.
+bool valid_perm(const std::string& str, std::array<int, 3>& perm) {
+  if (str.size() != 3) return false;
+  for (int i = 0; i < 3; ++i) {
+    if (str[i] < '0' || str[i] > '2') return false;
+    perm[i] = str[i] - '0';
+  }
   std::array<int, 3> sorted = perm;
   std::sort(sorted.begin(), sorted.end());
   return sorted == std::array<int, 3>{0, 1, 2};
@@ -254,15 +220,15 @@ void usage(const char* name) {
   std::cout << R"(
 Options:
   --thread_count=N
-  --type=t1,t2,...  (int2, uint2, int4, uint4, int8, uint8, fp8_e5m2, fp8_e4m3, fp16, bf16, fp32, fp64)
+  --bits=b1,b2,...  (element size in bits, e.g. 2, 4, 8, 16, 32, 64)
   --shape=d0,d1,d2
-  -perm=p1,p2,...   (digit strings over the axes, e.g. 021, 210; 012 is the
-                     identity and measures the aliased copy path)
+  -perm=p1,p2,...   (3-digit permutation strings over the axes, e.g. 021, 210;
+                     012 is the identity and measures the aliased copy path)
 
 Notes:
-  Multiple --type, --shape, and -perm options are allowed. These options form
+  Multiple --bits, --shape, and -perm options are allowed. These options form
   lists. The registered benchmarks are the Cartesian product of the shapes,
-  permutations, and types.
+  permutations, and bit widths.
 
   If a shape value is positive, it is a static shape. If it is negative, it is
   a dynamic shape of the same magnitude.
@@ -275,8 +241,8 @@ int main(int argc, char** argv) {
   constexpr unsigned max_threads = 32;
   int thread_count = std::min(max_threads, std::thread::hardware_concurrency());
   std::vector<std::array<int, 3>> shapes;
-  std::vector<int> perms;
-  std::vector<ynn_type> types;
+  std::vector<std::string> perms;
+  std::vector<int> bits;
   benchmark::Initialize(&argc, argv);
 
   for (int i = 1; i < argc;) {
@@ -294,8 +260,8 @@ int main(int argc, char** argv) {
       shapes.push_back({shape[0], shape[1], shape[2]});
       std::copy(argv + i + 1, argv + argc, argv + i);
       argc -= 1;
-    } else if (strncmp(argv[i], "--type=", 7) == 0) {
-      parse_list(argv[i] + 7, types);
+    } else if (strncmp(argv[i], "--bits=", 7) == 0) {
+      parse_list(argv[i] + 7, bits);
       std::copy(argv + i + 1, argv + argc, argv + i);
       argc -= 1;
     } else if (strncmp(argv[i], "--thread_count=", 15) == 0) {
@@ -311,12 +277,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (types.empty()) {
-    // int2/uint2 are omitted: there is no 2-bit transpose kernel yet.
-    types = {
-        ynn_type_int4, ynn_type_int8, ynn_type_uint8, ynn_type_fp8_e5m2,
-        ynn_type_fp16, ynn_type_bf16, ynn_type_fp32,
-    };
+  if (bits.empty()) {
+    bits = {2, 4, 8, 16, 32, 64};
   }
 
   if (thread_count < 1) {
@@ -330,11 +292,11 @@ int main(int argc, char** argv) {
 
   if (perms.empty()) {
     // All non-identity permutations.
-    perms = {21, 102, 120, 201, 210};
+    perms = {"021", "102", "120", "201", "210"};
   }
-  for (int p : perms) {
+  for (const std::string& p : perms) {
     std::array<int, 3> perm;
-    if (!decode_perm(p, perm)) {
+    if (!valid_perm(p, perm)) {
       usage(argv[0]);
       return -1;
     }
@@ -344,24 +306,24 @@ int main(int argc, char** argv) {
   ynn::threadpool_ptr threadpool =
       ynn::create_threadpool(scheduler.scheduler(), &scheduler);
 
-  for (ynn_type type : types) {
-    std::stringstream name;
-    name << "transpose_" << ynn::to_string(type);
-    auto* transpose_bench = benchmark::RegisterBenchmark(
-        name.str(), [=, &threadpool](benchmark::State& state) {
-          const int dim0 = state.range(0);
-          const int dim1 = state.range(1);
-          const int dim2 = state.range(2);
-          std::array<int, 3> perm;
-          decode_perm(state.range(3), perm);
-          ynn::bench(state, threadpool.get(), type, dim0, dim1, dim2, perm);
-        });
-    transpose_bench->ArgNames({"dim0", "dim1", "dim2", "perm"});
-    transpose_bench->UseRealTime();
-    transpose_bench->MeasureProcessCPUTime();
-    for (const auto& shape : shapes) {
-      for (int p : perms) {
-        transpose_bench->Args({shape[0], shape[1], shape[2], p});
+  for (int b : bits) {
+    for (const std::string& p : perms) {
+      std::array<int, 3> perm;
+      valid_perm(p, perm);
+      std::stringstream name;
+      name << "transpose_" << b << "bit/perm:" << p;
+      auto* transpose_bench = benchmark::RegisterBenchmark(
+          name.str(), [=, &threadpool](benchmark::State& state) {
+            const int dim0 = state.range(0);
+            const int dim1 = state.range(1);
+            const int dim2 = state.range(2);
+            ynn::bench(state, threadpool.get(), b, dim0, dim1, dim2, perm);
+          });
+      transpose_bench->ArgNames({"dim0", "dim1", "dim2"});
+      transpose_bench->UseRealTime();
+      transpose_bench->MeasureProcessCPUTime();
+      for (const auto& shape : shapes) {
+        transpose_bench->Args({shape[0], shape[1], shape[2]});
       }
     }
   }
