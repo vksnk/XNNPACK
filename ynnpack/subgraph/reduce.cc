@@ -570,18 +570,21 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
         prefix = slinky::simplify(prefix * alignments[i]);
       }
     }
-    // Reduction dimensions below already guarantee part of the product, so an
-    // outer reduction dimension only reserves the missing factor.
-    slinky::expr k_chunk_below = 1;
+    // Visiting dimensions inner to outer, k_chunk_so_far accumulates the
+    // chunk product already guaranteed by the inner reduction dimensions
+    // (including dimension 0's row reservation when it is a reduction
+    // dimension), so each outer reduction dimension only reserves the factor
+    // still missing from the target.
+    slinky::expr k_chunk_so_far = 1;
     for (int i = 0; i < a.rank(); ++i) {
       if (!k_dims[i]) continue;
       if (i > 0) {
         alignments[i] = slinky::simplify(slinky::min(
             slinky::max(1, slinky::ceil_div(slinky::expr(min_reduction_elems),
-                                            k_chunk_below)),
+                                            k_chunk_so_far)),
             a.extents[i]));
       }
-      k_chunk_below = slinky::simplify(k_chunk_below * alignments[i]);
+      k_chunk_so_far = slinky::simplify(k_chunk_so_far * alignments[i]);
     }
     std::vector<slinky::expr> split_factors = make_split_factors(
         subgraph->globals, a.extents, type_size_bytes(a.type),
