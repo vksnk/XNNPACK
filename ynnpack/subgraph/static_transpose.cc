@@ -20,6 +20,7 @@
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/kernels/transpose/transpose.h"
 #include "ynnpack/subgraph/runtime.h"
+#include "slinky/base/thread_pool.h"
 #include "ynnpack/subgraph/slinky.h"
 #include "ynnpack/subgraph/subgraph.h"
 #include "slinky/builder/pipeline.h"
@@ -222,56 +223,96 @@ void define_static_transpose(ynn_subgraph& subgraph, ynn_node& node,
       // the factor still missing (e.g. transposing 262144x256x4 int8 to
       // 256x4x262144: input rows of 4 elements are extended to 4x256).
       constexpr slinky::index_t row_target_bytes = 1024;
+      // For small tensors the row floors can leave too few tiles to occupy
+      // the thread pool. In that case shorter rows are the lesser evil, so
+      // the row target shrinks (halving, down to this minimum) until there
+      // are enough tasks.
+      constexpr slinky::index_t min_row_target_bytes = 256;
       const size_t size_bytes =
           std::max<size_t>(1, type_size_bytes(output.type));
       std::vector<slinky::expr> extents = output.physical_extents();
-      std::vector<slinky::expr> alignments(rank);
 
-      auto reserve = [&](int d, const slinky::expr& floor) {
-        slinky::expr a = slinky::simplify(slinky::min(
-            slinky::max(1, floor), extents[d]));
-        if (alignments[d].defined()) {
-          alignments[d] = slinky::simplify(slinky::max(alignments[d], a));
-        } else {
-          alignments[d] = a;
+      auto make_splits = [&](slinky::index_t target_bytes) {
+        std::vector<slinky::expr> alignments(rank);
+        auto reserve = [&](int d, const slinky::expr& floor) {
+          slinky::expr a = slinky::simplify(slinky::min(
+              slinky::max(1, floor), extents[d]));
+          if (alignments[d].defined()) {
+            alignments[d] = slinky::simplify(slinky::max(alignments[d], a));
+          } else {
+            alignments[d] = a;
+          }
+          return a;
+        };
+
+        // Output rows. Dimension 0 of the output buffer is counted in
+        // physical (packed) units of size_bytes each, so the row target is
+        // too.
+        const slinky::index_t out_row =
+            std::max<slinky::index_t>(1, target_bytes / size_bytes);
+        slinky::expr out_run = 1;
+        for (int d = 0; d < rank && extents[d].defined(); ++d) {
+          slinky::expr a =
+              reserve(d, slinky::ceil_div(slinky::expr(out_row), out_run));
+          out_run = slinky::simplify(out_run * a);
         }
-        return a;
+
+        // Input rows, reserved on the output dimension each input dimension
+        // maps to. These are counted in logical elements.
+        const slinky::index_t in_row = std::max<slinky::index_t>(
+            1, target_bytes * type_element_count(output.type) / size_bytes);
+        slinky::expr in_run = 1;
+        for (int k = 0; k < input.rank(); ++k) {
+          int d = 0;
+          while (d < rank && op.permutation[d] != k) d++;
+          if (d >= rank || !extents[d].defined()) break;
+          slinky::expr a =
+              reserve(d, slinky::ceil_div(slinky::expr(in_row), in_run));
+          if (d == 0) {
+            // Output dimension 0 is in physical units; the input run it
+            // contributes is elem_count logical elements per unit.
+            a = a * type_element_count(output.type);
+          }
+          in_run = slinky::simplify(in_run * a);
+        }
+        return make_split_factors(runtime.globals, extents,
+                                  type_size_bytes(output.type),
+                                  /*given_splits=*/{}, /*loop_order=*/{},
+                                  alignments);
       };
 
-      // Output rows. Dimension 0 of the output buffer is counted in physical
-      // (packed) units of size_bytes each, so the row target is too.
-      const slinky::index_t out_row =
-          std::max<slinky::index_t>(1, row_target_bytes / size_bytes);
-      slinky::expr out_run = 1;
-      for (int d = 0; d < rank && extents[d].defined(); ++d) {
-        slinky::expr a =
-            reserve(d, slinky::ceil_div(slinky::expr(out_row), out_run));
-        out_run = slinky::simplify(out_run * a);
-      }
-
-      // Input rows, reserved on the output dimension each input dimension
-      // maps to. These are counted in logical elements.
-      const slinky::index_t in_row = std::max<slinky::index_t>(
-          1, row_target_bytes * type_element_count(output.type) / size_bytes);
-      slinky::expr in_run = 1;
-      for (int k = 0; k < input.rank(); ++k) {
-        int d = 0;
-        while (d < rank && op.permutation[d] != k) d++;
-        if (d >= rank || !extents[d].defined()) break;
-        slinky::expr a =
-            reserve(d, slinky::ceil_div(slinky::expr(in_row), in_run));
-        if (d == 0) {
-          // Output dimension 0 is in physical units; the input run it
-          // contributes is elem_count logical elements per unit.
-          a = a * type_element_count(output.type);
+      // The number of tiles the splits produce, or nullopt if it can't be
+      // computed (dynamic shapes).
+      auto count_tasks =
+          [&](const std::vector<slinky::expr>& splits)
+          -> std::optional<slinky::index_t> {
+        slinky::index_t tasks = 1;
+        for (int d = 0; d < rank; ++d) {
+          if (!extents[d].defined() || !splits[d].defined()) continue;
+          auto extent = slinky::as_constant(extents[d]);
+          auto split = slinky::as_constant(slinky::simplify(splits[d]));
+          if (!extent || !split || *split <= 0) return std::nullopt;
+          tasks *= ceil_div<slinky::index_t>(*extent, *split);
         }
-        in_run = slinky::simplify(in_run * a);
+        return tasks;
+      };
+
+      // Relax only when there aren't enough tiles to give every thread one:
+      // measured (9900X, 4 threads): a balanced task count equal to the
+      // thread count is faster with full-size rows than more tasks with
+      // shorter rows.
+      const slinky::index_t task_target =
+          runtime.threadpool() ? runtime.threadpool()->thread_count() + 1 : 1;
+      std::vector<slinky::expr> splits = make_splits(row_target_bytes);
+      for (slinky::index_t target = row_target_bytes / 2;
+           target >= min_row_target_bytes; target /= 2) {
+        std::optional<slinky::index_t> tasks = count_tasks(splits);
+        if (!tasks || *tasks >= task_target) break;
+        std::vector<slinky::expr> relaxed = make_splits(target);
+        std::optional<slinky::index_t> relaxed_tasks = count_tasks(relaxed);
+        if (!relaxed_tasks || *relaxed_tasks <= *tasks) break;
+        splits = std::move(relaxed);
       }
-      std::vector<slinky::expr> splits =
-          make_split_factors(runtime.globals, extents,
-                             type_size_bytes(output.type),
-                             /*given_splits=*/{}, /*loop_order=*/{},
-                             alignments);
       sched = runtime.make_schedule(output_dims, extents, splits);
     }
     if (!sched) {
