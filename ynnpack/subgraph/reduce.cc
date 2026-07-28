@@ -293,7 +293,9 @@ slinky::raw_buffer_ptr make_reduce_identity(ynn_type type, int rank,
   }
 
   assert(type_size_bytes(type) <= sizeof(double));
-  alignas(double) char storage[2 * sizeof(double)] = {0, };
+  alignas(double) char storage[2 * sizeof(double)] = {
+      0,
+  };
   value.base = storage;
   convert_n(value_f32, n, type, value.base);
   return slinky::raw_buffer::make_copy(value);
@@ -538,36 +540,35 @@ ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
     // A tile is read as contiguous rows: dimension 0's split, extended by the
     // kept dimensions above it while their extents are covered whole. Short
     // rows are dominated by per-row kernel startup, which is especially
-    // expensive for the sub-byte unpack (measured on 9900X: reducing the
-    // outer dimension of 1024x4096x64 int2 is 2.3x slower with 128-byte rows
-    // than with 1KB rows, and of 1024x16x16384 int8 1.7x slower with 64-byte
-    // rows).
+    // expensive for the sub-byte unpack.
     constexpr slinky::index_t row_target_bytes = 1024;
     // Each tile must reduce at least this many elements, as the *product* of
     // its reduction-dimension chunks, so writing out the partial accumulators
     // is amortized: with a chunk of 1 the "partial reduction" is just an
-    // expensive copy of the input (up to 43x slower on 1024x1024x256 int2,
-    // outer dimension reduced). This floor is also what lets a reduction
+    // expensive copy of the input. This floor is also what lets a reduction
     // dimension small enough to fit in the tile reach its full extent, so no
     // partial reduction is created at all.
     constexpr slinky::index_t min_reduction_elems = 256;
 
-    const size_t stored_size = std::max<size_t>(1, type_size_bytes(stored_type));
+    const size_t stored_size =
+        std::max<size_t>(1, type_size_bytes(stored_type));
     const slinky::index_t row_elems = std::max<size_t>(
         1, row_target_bytes * type_element_count(stored_type) / stored_size);
     // Alignments passed to make_split_factors must not exceed the extents, so
     // every floor below is clamped by the extent of its dimension.
     std::vector<slinky::expr> alignments(a.rank());
-    alignments[0] = slinky::simplify(slinky::min(row_elems, a.extents[0]));
-    if (!k_dims[0]) {
-      // Dimension 0 reserves the whole row target; each kept dimension of the
-      // contiguous prefix above it only reserves the factor still missing.
-      slinky::expr prefix = alignments[0];
-      for (int i = 1; i < a.rank() && !k_dims[i]; ++i) {
-        alignments[i] = slinky::simplify(slinky::min(
-            slinky::max(1, slinky::ceil_div(slinky::expr(row_elems), prefix)),
-            a.extents[i]));
-        prefix = slinky::simplify(prefix * alignments[i]);
+    if (a.rank() > 0) {
+      alignments[0] = slinky::simplify(slinky::min(row_elems, a.extents[0]));
+      if (!k_dims[0]) {
+        // Dimension 0 reserves the whole row target; each kept dimension of the
+        // contiguous prefix above it only reserves the factor still missing.
+        slinky::expr prefix = alignments[0];
+        for (int i = 1; i < a.rank() && !k_dims[i]; ++i) {
+          alignments[i] = slinky::simplify(slinky::min(
+              slinky::max(1, slinky::ceil_div(slinky::expr(row_elems), prefix)),
+              a.extents[i]));
+          prefix = slinky::simplify(prefix * alignments[i]);
+        }
       }
     }
     // Visiting dimensions inner to outer, k_chunk_so_far accumulates the

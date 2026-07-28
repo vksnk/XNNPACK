@@ -210,8 +210,7 @@ slinky::box_expr make_broadcast_bounds(
 std::vector<slinky::expr> make_split_factors(
     ynn::slinky_globals& globals, ynn::span<const slinky::expr> extents,
     const slinky::expr& element_cost,
-    ynn::span<const slinky::expr> given_splits,
-    ynn::span<const int> loop_order,
+    ynn::span<const slinky::expr> given_splits, ynn::span<const int> loop_order,
     ynn::span<const slinky::expr> alignments) {
   const int rank = extents.size();
 
