@@ -277,9 +277,31 @@ enum ynn_binary_operator {
   ynn_binary_squared_difference = 9,
   ynn_binary_subtract = 10,
 
+  // Comparisons. The output of these operators is a `ynn_type_uint8` tensor
+  // which is 1 where the comparison holds and 0 where it does not, which is
+  // also what `ynn_define_select` expects as its condition.
+  ynn_binary_equal = 11,
+  ynn_binary_not_equal = 12,
+  ynn_binary_less = 13,
+  ynn_binary_less_equal = 14,
+  ynn_binary_greater = 15,
+  ynn_binary_greater_equal = 16,
+
+  // Logical operators on such 0/1 `ynn_type_uint8` tensors.
+  ynn_binary_logical_and = 17,
+  ynn_binary_logical_or = 18,
+
   // Internal use only
   ynn_binary_exp_subtract,
 };
+
+// Returns true if `op` compares its inputs, i.e. produces a boolean
+// (`ynn_type_uint8`, 0 or 1) result rather than a result in the type of its
+// inputs.
+static inline int ynn_binary_operator_is_comparison(
+    enum ynn_binary_operator op) {
+  return op >= ynn_binary_equal && op <= ynn_binary_greater_equal;
+}
 
 // Defines a binary operation of two inputs to a single output. The two inputs
 // are permitted to have a differing number of dimensions. The input with fewer
