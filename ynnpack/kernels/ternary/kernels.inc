@@ -34,3 +34,5 @@ YNN_ELEMENTWISE_KERNEL(arch_flag::none, dequantize_uint8_to_fp32, dequantize, 0,
 YNN_ELEMENTWISE_KERNEL(arch_flag::none, dequantize_int32_to_fp32, dequantize, 0, int32_t, int32_t, float, float)
 YNN_ELEMENTWISE_KERNEL(arch_flag::none, dequantize_int4_to_fp32, dequantize, 0, int4x2, int32_t, float, float)
 YNN_ELEMENTWISE_KERNEL(arch_flag::none, dequantize_int2_to_fp32, dequantize, 0, int2x4, int32_t, float, float)
+YNN_ELEMENTWISE_KERNEL(arch_flag::none, select_uint8_fp32_fp32, select, 0, uint8_t, float, float, float)
+YNN_ELEMENTWISE_KERNEL(arch_flag::none, select_uint8_int32_int32, select, 0, uint8_t, int32_t, int32_t, int32_t)

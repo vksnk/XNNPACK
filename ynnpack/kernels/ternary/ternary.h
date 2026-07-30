@@ -45,6 +45,7 @@ enum class ternary_op {
   quantize_int8,      // i8(a/b + c)
   quantize_uint8,     // u8(a/b + c)
   dequantize,         // (a - b)*c
+  select,             // a ? b : c
 };
 
 const char* to_string(ternary_op op);

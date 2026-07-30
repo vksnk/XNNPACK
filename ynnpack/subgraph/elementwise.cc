@@ -862,6 +862,49 @@ ynn_status ynn_define_binary(ynn_subgraph_t subgraph, ynn_binary_operator op,
   return ynn_status_success;
 }
 
+ynn_status ynn_define_select(ynn_subgraph_t subgraph, uint32_t condition_id,
+                             uint32_t input_true_id, uint32_t input_false_id,
+                             uint32_t* output_id, uint32_t flags) {
+  YNN_RETURN_IF_ERROR(validate_subgraph("select", subgraph));
+  YNN_RETURN_IF_ERROR(
+      validate_input_tensor("select", subgraph, "condition_id", condition_id));
+  YNN_RETURN_IF_ERROR(validate_input_tensor("select", subgraph,
+                                            "input_true_id", input_true_id));
+  YNN_RETURN_IF_ERROR(validate_input_tensor("select", subgraph,
+                                            "input_false_id", input_false_id));
+  YNN_RETURN_IF_ERROR(
+      validate_output_tensor("select", subgraph, "output_id", output_id));
+
+  const ynn_value& condition = subgraph->value(condition_id);
+  const ynn_value& a = subgraph->value(input_true_id);
+  const ynn_value& b = subgraph->value(input_false_id);
+  if (condition.type != ynn_type_uint8) {
+    YNN_LOG_ERROR() << "For node `select`, the condition must be uint8, got "
+                    << condition.type;
+    return ynn_status_unsupported_parameter;
+  }
+  if (a.type != b.type) {
+    YNN_LOG_ERROR() << "For node `select`, the values must have the same type, "
+                    << "got " << a.type << " and " << b.type;
+    return ynn_status_unsupported_parameter;
+  }
+  ynn_value& x = subgraph->get_output_value(output_id, a.type);
+
+  ternary_kernel_fn kernel = get_ternary_kernel(
+      ternary_op::select, condition.type, a.type, b.type, x.type);
+  if (!kernel) {
+    YNN_LOG_ERROR() << "Unsupported select for value type " << a.type
+                    << " and output type " << x.type;
+    return ynn_status_unsupported_parameter;
+  }
+
+  ynn_node node;
+  ynn::define_ternary(*subgraph, node, condition_id, input_true_id,
+                      input_false_id, *output_id, ternary_op::select, kernel);
+  subgraph->add_node(std::move(node));
+  return ynn_status_success;
+}
+
 }  // extern "C"
 
 }  // namespace ynn
