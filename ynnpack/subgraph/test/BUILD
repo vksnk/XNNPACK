@@ -283,6 +283,23 @@ cc_test(
 )
 
 cc_test(
+    name = "build_bench",
+    srcs = ["build_bench.cc"],
+    args = ["--benchmark_min_time=1x"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        ":scheduler",
+        "//ynnpack",
+        "//ynnpack/base",
+    ] + ynn_benchmark_deps(),
+)
+
+cc_test(
     name = "dot_bench",
     srcs = ["dot_bench.cc"],
     args = ["--benchmark_min_time=1x"],
