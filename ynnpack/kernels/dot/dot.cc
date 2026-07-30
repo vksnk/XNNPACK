@@ -292,9 +292,27 @@ float dot_arch_cost_factor(uint64_t arch) {
   if (arch == arch_flag::none) {
     // We should only use the default dot kernel if there is no other choice.
     return 100.0f;
-  } else {
-    return 1.0f;
   }
+#ifdef YNN_ARCH_X86
+  // `estimate_dot_cost` only counts loads, so it cannot see that a kernel using
+  // a wider multiply-accumulate instruction does the same work with fewer
+  // instructions. Without this, an AVX512 kernel with a large `block_k` is
+  // preferred over the VNNI kernel for the same tile, because more `block_k`
+  // means fewer blocks and hence fewer modeled loads -- but measured on Zen 5,
+  // the VNNI int4 kernels are ~1.8x faster than the AVX512 ones they lose to
+  // (128x1536x6144: 2.16ms for 8x16x8_avx512vnni vs 3.84ms for
+  // 5x32x32_avx512).
+  if (arch & arch_flag::amxint8) {
+    // A tile multiply accumulates 16x16x64 per instruction.
+    return 0.25f;
+  }
+  if (arch & arch_flag::avx512vnni) {
+    // vpdpbusd accumulates 4 products per lane, where the AVX512 kernels need
+    // a vpmaddubsw/vpmaddwd/vpaddd chain for 2.
+    return 0.5f;
+  }
+#endif  // YNN_ARCH_X86
+  return 1.0f;
 }
 
 template <typename A, typename B, typename C>
