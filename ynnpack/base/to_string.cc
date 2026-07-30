@@ -97,6 +97,22 @@ const char* to_string(enum ynn_binary_operator op) {
       return "leaky_relu";
     case ynn_binary_exp_subtract:
       return "exp_subtract";
+    case ynn_binary_equal:
+      return "equal";
+    case ynn_binary_not_equal:
+      return "not_equal";
+    case ynn_binary_less:
+      return "less";
+    case ynn_binary_less_equal:
+      return "less_equal";
+    case ynn_binary_greater:
+      return "greater";
+    case ynn_binary_greater_equal:
+      return "greater_equal";
+    case ynn_binary_logical_and:
+      return "logical_and";
+    case ynn_binary_logical_or:
+      return "logical_or";
     case ynn_binary_invalid:
       return "invalid";
   }

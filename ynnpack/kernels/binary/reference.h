@@ -55,6 +55,78 @@ struct subtract : public binary_op_info {
   bfloat16 operator()(float a, bfloat16 b) const { return bfloat16(a - b); }
 };
 
+// Comparisons, which write a 0 or 1 (as a uint8) rather than a value in the
+// type of their inputs.
+struct comparison_op_info : public binary_op_info {
+  tolerance_spec tolerance() const override {
+    return tolerance_spec{/*relative=*/0.0f, /*absolute=*/0.0f};
+  }
+};
+
+struct equal : public comparison_op_info {
+  float operator()(float a, float b) const override { return a == b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a == b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a == b ? 1 : 0;
+  }
+};
+
+struct not_equal : public comparison_op_info {
+  float operator()(float a, float b) const override { return a != b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a != b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a != b ? 1 : 0;
+  }
+};
+
+struct less : public comparison_op_info {
+  float operator()(float a, float b) const override { return a < b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a < b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a < b ? 1 : 0;
+  }
+};
+
+struct less_equal : public comparison_op_info {
+  float operator()(float a, float b) const override { return a <= b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a <= b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a <= b ? 1 : 0;
+  }
+};
+
+struct greater : public comparison_op_info {
+  float operator()(float a, float b) const override { return a > b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a > b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a > b ? 1 : 0;
+  }
+};
+
+struct greater_equal : public comparison_op_info {
+  float operator()(float a, float b) const override { return a >= b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a >= b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a >= b ? 1 : 0;
+  }
+};
+
+struct logical_and : public comparison_op_info {
+  float operator()(float a, float b) const override { return a && b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a && b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a && b ? 1 : 0;
+  }
+};
+
+struct logical_or : public comparison_op_info {
+  float operator()(float a, float b) const override { return a || b ? 1 : 0; }
+  double operator()(double a, double b) const override { return a || b ? 1 : 0; }
+  int32_t operator()(int32_t a, int32_t b) const override {
+    return a || b ? 1 : 0;
+  }
+};
+
 struct multiply : public binary_op_info {
   float operator()(float a, float b) const override { return a * b; }
   double operator()(double a, double b) const override { return a * b; }

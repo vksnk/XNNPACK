@@ -771,6 +771,10 @@ namespace {
 
 ynn_type get_binary_output_type(ynn_binary_operator op, const ynn_value& a,
                                 const ynn_value& b) {
+  if (ynn_binary_operator_is_comparison(op)) {
+    // Comparisons produce a boolean, which we represent as a 0 or 1 uint8.
+    return ynn_type_uint8;
+  }
   if (is_convert_lossless(a.type, b.type)) {
     return b.type;
   } else if (is_convert_lossless(b.type, a.type)) {

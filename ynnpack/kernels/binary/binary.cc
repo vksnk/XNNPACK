@@ -61,6 +61,104 @@ void binary_impl(size_t m, size_t n, size_t stride_a_m, size_t stride_a_n,
   }
 }
 
+// Comparisons and the logical operators on their results write a uint8 0 or 1
+// rather than a value in the type of their inputs, so they need their own
+// reference implementation.
+template <typename T, typename Operator>
+void compare_impl(size_t m, size_t n, size_t stride_a_m, size_t stride_a_n,
+                  const void* va, size_t stride_b_m, size_t stride_b_n,
+                  const void* vb, size_t stride_x_m, void* vx,
+                  const binary_params*) {
+  auto a = reinterpret_cast<const T*>(va);
+  auto b = reinterpret_cast<const T*>(vb);
+  auto x = reinterpret_cast<uint8_t*>(vx);
+  Operator op;
+  for (size_t i = 0; i < m; ++i) {
+    for (size_t j = 0; j < n; ++j) {
+      const T a_j = *offset_bytes(a, j * stride_a_n);
+      const T b_j = *offset_bytes(b, j * stride_b_n);
+      x[j] = op(a_j, b_j) ? 1 : 0;
+    }
+    a = offset_bytes(a, stride_a_m);
+    b = offset_bytes(b, stride_b_m);
+    x = offset_bytes(x, stride_x_m);
+  }
+}
+
+struct EqualOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a == b;
+  }
+};
+struct NotEqualOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a != b;
+  }
+};
+struct LessOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a < b;
+  }
+};
+struct LessEqualOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a <= b;
+  }
+};
+struct GreaterOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a > b;
+  }
+};
+struct GreaterEqualOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a >= b;
+  }
+};
+struct LogicalAndOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a && b;
+  }
+};
+struct LogicalOrOp {
+  template <typename T>
+  bool operator()(T a, T b) const {
+    return a || b;
+  }
+};
+
+// Returns a reference kernel comparing two `T` tensors into a uint8 tensor.
+template <typename T>
+binary_kernel_fn get_compare_reference_kernel(ynn_binary_operator op) {
+  switch (op) {
+    case ynn_binary_equal:
+      return compare_impl<T, EqualOp>;
+    case ynn_binary_not_equal:
+      return compare_impl<T, NotEqualOp>;
+    case ynn_binary_less:
+      return compare_impl<T, LessOp>;
+    case ynn_binary_less_equal:
+      return compare_impl<T, LessEqualOp>;
+    case ynn_binary_greater:
+      return compare_impl<T, GreaterOp>;
+    case ynn_binary_greater_equal:
+      return compare_impl<T, GreaterEqualOp>;
+    case ynn_binary_logical_and:
+      return compare_impl<T, LogicalAndOp>;
+    case ynn_binary_logical_or:
+      return compare_impl<T, LogicalOrOp>;
+    default:
+      return nullptr;
+  }
+}
+
 // We can't use STL's functional ops for integers because they will crash if
 // they overflow.
 struct AddOp {
@@ -226,6 +324,23 @@ binary_kernel_fn get_binary_kernel(ynn_binary_operator op, ynn_type type_a,
   } else if (type_a == ynn_type_int32 && type_b == ynn_type_int32 &&
              type_x == ynn_type_int32) {
     return get_binary_reference_kernel(op, type_x);
+  } else if (type_a == type_b && type_x == ynn_type_uint8) {
+    // Comparisons of any two same-typed tensors, and logical operators on
+    // their uint8 results.
+    switch (type_a) {
+      case ynn_type_fp32:
+        return get_compare_reference_kernel<float>(op);
+      case ynn_type_fp64:
+        return get_compare_reference_kernel<double>(op);
+      case ynn_type_int32:
+        return get_compare_reference_kernel<int32_t>(op);
+      case ynn_type_uint8:
+        return get_compare_reference_kernel<uint8_t>(op);
+      case ynn_type_int8:
+        return get_compare_reference_kernel<int8_t>(op);
+      default:
+        return nullptr;
+    }
   }
   return nullptr;
 }
