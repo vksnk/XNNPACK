@@ -88,7 +88,9 @@ enum ynn_type {
 #define YNN_VALUE_FLAG_EXTERNAL_OUTPUT (1 << 1)
 #define YNN_VALUE_FLAG_COPY_DATA (1 << 2)
 #define YNN_VALUE_FLAG_NO_EXCESS_PRECISION (1 << 3)
-#define YNN_VALUE_FLAG_COPY_DATA_FP32 (1 << 4)
+#define YNN_VALUE_FLAG_DATA_IS_FP32 (1 << 4)
+#define YNN_VALUE_FLAG_COPY_DATA_FP32 \
+  (YNN_VALUE_FLAG_COPY_DATA | YNN_VALUE_FLAG_DATA_IS_FP32)
 
 // Define a new tensor in a subgraph.
 //
@@ -155,8 +157,8 @@ enum ynn_unary_operator {
   ynn_unary_abs = 1,
   ynn_unary_ceil = 2,
   ynn_unary_convert = 3,
-  ynn_unary_cosine = 4,
-  ynn_unary_cube_root = 5,
+  ynn_unary_cos = 4,
+  ynn_unary_cbrt = 5,
   ynn_unary_erf = 6,
   ynn_unary_exp = 7,
   ynn_unary_expm1 = 8,
@@ -165,21 +167,30 @@ enum ynn_unary_operator {
   ynn_unary_log = 11,
   ynn_unary_log1p = 12,
   ynn_unary_negate = 13,
-  ynn_unary_reciprocal_square_root = 14,
+  ynn_unary_rsqrt = 14,
   ynn_unary_round = 15,
   ynn_unary_sigmoid = 16,
   ynn_unary_sign = 17,
-  ynn_unary_sine = 18,
+  ynn_unary_sin = 18,
   ynn_unary_square = 19,
-  ynn_unary_square_root = 20,
+  ynn_unary_sqrt = 20,
   ynn_unary_tanh = 21,
   ynn_unary_poly3 = 22,
   ynn_unary_round_to_bf16 = 23,
   ynn_unary_approx_erf = 24,
   ynn_unary_approx_tanh = 25,
+  ynn_unary_tan = 26,
 
   // Internal use only
   ynn_unary_requantize_to_uint8,
+
+  // For backwards compatibility
+  ynn_unary_cosine = ynn_unary_cos,
+  ynn_unary_sine = ynn_unary_sin,
+  ynn_unary_tangent = ynn_unary_tan,
+  ynn_unary_square_root = ynn_unary_sqrt,
+  ynn_unary_reciprocal_square_root = ynn_unary_rsqrt,
+  ynn_unary_cube_root = ynn_unary_cbrt,
 };
 
 // Defines a unary operation of a single input to a single output.
@@ -261,6 +272,9 @@ enum ynn_binary_operator {
   ynn_binary_pow = 8,
   ynn_binary_squared_difference = 9,
   ynn_binary_subtract = 10,
+
+  // Internal use only
+  ynn_binary_exp_subtract,
 };
 
 // Defines a binary operation of two inputs to a single output. The two inputs

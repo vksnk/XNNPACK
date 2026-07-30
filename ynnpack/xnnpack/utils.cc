@@ -823,11 +823,11 @@ ynn_unary_operator unary_operator_from_xnn(xnn_unary_operator op) {
     case xnn_unary_square:
       return ynn_unary_square;
     case xnn_unary_square_root:
-      return ynn_unary_square_root;
+      return ynn_unary_sqrt;
     case xnn_unary_cube_root:
-      return ynn_unary_cube_root;
+      return ynn_unary_cbrt;
     case xnn_unary_reciprocal_square_root:
-      return ynn_unary_reciprocal_square_root;
+      return ynn_unary_rsqrt;
     case xnn_unary_log:
       return ynn_unary_log;
     case xnn_unary_exp:
@@ -839,11 +839,11 @@ ynn_unary_operator unary_operator_from_xnn(xnn_unary_operator op) {
     case xnn_unary_sign:
       return ynn_unary_sign;
     case xnn_unary_cosine:
-      return ynn_unary_cosine;
+      return ynn_unary_cos;
     case xnn_unary_sigmoid:
       return ynn_unary_sigmoid;
     case xnn_unary_sine:
-      return ynn_unary_sine;
+      return ynn_unary_sin;
     case xnn_unary_invalid:
     case xnn_unary_approxgelu:
     case xnn_unary_clamp:

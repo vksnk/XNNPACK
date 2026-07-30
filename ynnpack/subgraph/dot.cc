@@ -703,6 +703,8 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
     auto sched =
         runtime.make_schedule(dims, output.physical_extents(),
                               output.buffer->elem_size(), given_splits);
+    sched->loop_splits[0].step_is_required = true;
+    sched->loop_splits[1].step_is_required = true;
 
     // TODO(vksnk): This is a temporary workaround to avoid recomputing packed
     // buffer. The proper fix would probably involve adding a loop splits for
@@ -711,10 +713,6 @@ uint32_t define_pack_b(ynn_subgraph_t subgraph, const dot_type& type,
       sched->force_root = true;
     }
 
-    // ki (dim 0) and ko (dim 2) must not be split.
-    // We enforce this by requiring their step to be equal to their extent.
-    sched->loop_splits[0].step_is_required = true;
-    sched->loop_splits[2].step_is_required = true;
     // The real bounds of the input's n dimension are blocks of size block_n
     // indexed by `no`, which breaks the scheduler's source region inference.
     // Declare a virtual 1-to-1 mapping with `no` instead, so producers of the
