@@ -22,6 +22,7 @@
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/kernels/binary/binary.h"
 #include "ynnpack/kernels/dequantize_dot/dequantize_dot.h"
+#include "ynnpack/kernels/dot/dot.h"
 #include "ynnpack/kernels/reduce/reduce.h"
 #include "ynnpack/kernels/ternary/ternary.h"
 #include "ynnpack/kernels/unary/unary.h"
@@ -2327,14 +2328,27 @@ bool rewrite_dot_of_transpose(ynn_subgraph& subgraph, ynn_node& node,
   const int64_t m = constant_extent(a, 1);
   const int64_t k = constant_extent(a, 0);
   const int64_t n = constant_extent(b, 1);
-  if (m < 0 || k < 0 || n < 0) return false;
-  if (m * (k + n) * 4 > n * k) return false;
+  if (m < 0 || n < 0) return false;
+  if (k < 0) {
+    // A dot against a cache has the number of cached entries for its reduction
+    // dimension, which is only known at runtime. The comparison below holds for
+    // every `k` above `4*m*n / (n - 4*m)`, so requiring twice the margin in
+    // `n` against `m` makes it true for all but the shortest of caches, which
+    // are cheap either way.
+    if (n < 8 * m) return false;
+  } else if (m * (k + n) * 4 > n * k) {
+    return false;
+  }
   // With a single row both of the transposes we are about to make are only a
   // change of metadata; with more than one they are (small) copies.
   const bool transposes_are_free = m == 1;
-  // Integer dots carry quantization through rewrites that inspect which
-  // operand is which, so leave those alone.
-  if (ynn::type_is_integral(a.type) || ynn::type_is_integral(b.type)) return false;
+  // The operands change places, and for an integer dot they are not
+  // interchangeable: `vpdpbusd` fixes which of its two operands is the unsigned
+  // one, so the swapped dot needs a kernel for the reversed pair of types.
+  if (ynn::type_is_integral(a.type) || ynn::type_is_integral(b.type)) {
+    const ynn_value& c = subgraph.value(node.outputs[0]);
+    if (!has_dot_kernel({b.type, a.type, c.type})) return false;
+  }
   // Swapping the operands swaps which one broadcasts, so the batch dimensions
   // have to agree already.
   for (size_t d = 2; d < a.rank(); ++d) {

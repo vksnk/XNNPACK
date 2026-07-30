@@ -132,6 +132,13 @@ dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape = {},
                           std::optional<bool> transpose_a = std::nullopt,
                           uint64_t arch_flags = get_supported_arch_flags());
 
+// True if any kernel exists for this combination of types. Unlike
+// `get_dot_kernel`, a combination with no kernels at all is an answer rather
+// than an error, so this is what to ask before rewriting a dot into one with
+// different operand types.
+bool has_dot_kernel(const dot_type& type,
+                    uint64_t arch_flags = get_supported_arch_flags());
+
 }  // namespace ynn
 
 #endif  // XNNPACK_YNNPACK_KERNELS_DOT_DOT_H_

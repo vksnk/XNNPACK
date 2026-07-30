@@ -161,5 +161,116 @@ TEST(fusion, dot_of_transpose_is_correct) {
   }
 }
 
+// The same graph with the operand types a dynamically quantized attention has:
+// the queries are unsigned and the keys are signed.
+struct QuantizedScoresGraph {
+  static constexpr size_t kHeads = 2;
+  static constexpr size_t kHead = 8;
+
+  uint32_t q_id = 0;
+  uint32_t k_id = 1;
+  uint32_t scores_id = 2;
+  SubgraphBuilder builder{3};
+
+  QuantizedScoresGraph(size_t queries, size_t keys, ynn_type k_type)
+      : QuantizedScoresGraph(queries, keys, ynn_type_uint8, k_type) {}
+
+  QuantizedScoresGraph(size_t queries, size_t keys, ynn_type q_type,
+                       ynn_type k_type) {
+    builder.AddInput(q_type, {kHeads, queries, kHead}, q_id)
+        .AddInput(k_type, {kHeads, keys, kHead}, k_id)
+        .AddOutput(ynn_type_int32, {kHeads, queries, keys}, scores_id);
+
+    const int32_t perm[] = {0, 2, 1};
+    uint32_t k_transposed_id = YNN_INVALID_VALUE_ID;
+    EXPECT_EQ(ynn_define_static_transpose(builder.GetSubgraph(), /*rank=*/3,
+                                          perm, k_id, &k_transposed_id,
+                                          /*flags=*/0),
+              ynn_status_success);
+
+    uint32_t out_id = scores_id;
+    EXPECT_EQ(ynn_define_dot(builder.GetSubgraph(), /*num_k_dims=*/1, q_id,
+                             k_transposed_id,
+                             /*input_c_id=*/YNN_INVALID_VALUE_ID, &out_id,
+                             /*flags=*/0),
+              ynn_status_success);
+  }
+};
+
+TEST(fusion, dot_of_transpose_quantized) {
+  // A key cache is packed on every decode step, which is the whole cost the
+  // rewrite exists to remove, and it is quantized in every real model.
+  QuantizedScoresGraph graph(/*queries=*/1, /*keys=*/64, ynn_type_int8);
+  ynn_subgraph& subgraph = *graph.builder.GetSubgraph();
+  ASSERT_TRUE(IsPacked(subgraph, graph.k_id));
+
+  subgraph.fusion();
+  subgraph.invalidate_dead_values();
+
+  EXPECT_EQ(DotRowOperand(subgraph), graph.k_id);
+  EXPECT_FALSE(IsPacked(subgraph, graph.k_id));
+  EXPECT_TRUE(IsPacked(subgraph, graph.q_id));
+}
+
+TEST(fusion, dot_of_transpose_declines_without_a_kernel_for_swapped_types) {
+  // Swapping uint8 x int4 would ask for an int4 x uint8 kernel, which does not
+  // exist: the sub-byte operand only has kernels as the packed one.
+  QuantizedScoresGraph graph(/*queries=*/1, /*keys=*/64, ynn_type_int4);
+  ynn_subgraph& subgraph = *graph.builder.GetSubgraph();
+
+  subgraph.fusion();
+  subgraph.invalidate_dead_values();
+
+  EXPECT_EQ(DotRowOperand(subgraph), graph.q_id);
+}
+
+TEST(fusion, dot_of_transpose_quantized_is_correct) {
+  constexpr size_t kKeys = 37;  // Not a multiple of any vector width.
+  QuantizedScoresGraph graph(/*queries=*/1, /*keys=*/kKeys, ynn_type_int8);
+
+  Runtime runtime(graph.builder.GetSubgraph());
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+  const std::vector<size_t> q_shape = {QuantizedScoresGraph::kHeads, 1,
+                                       QuantizedScoresGraph::kHead};
+  const std::vector<size_t> k_shape = {QuantizedScoresGraph::kHeads, kKeys,
+                                       QuantizedScoresGraph::kHead};
+  const std::vector<size_t> scores_shape = {QuantizedScoresGraph::kHeads, 1,
+                                            kKeys};
+
+  Tensor<uint8_t> q(q_shape);
+  Tensor<int8_t> k(k_shape);
+  Tensor<int32_t> scores(scores_shape);
+  // Values at both ends of each range, so a kernel that got the signedness of
+  // an operand wrong could not pass.
+  for (size_t h = 0; h < QuantizedScoresGraph::kHeads; ++h) {
+    for (size_t c = 0; c < QuantizedScoresGraph::kHead; ++c) {
+      q(h, 0, c) = static_cast<uint8_t>(200 + c + h);
+    }
+    for (size_t s = 0; s < kKeys; ++s) {
+      for (size_t c = 0; c < QuantizedScoresGraph::kHead; ++c) {
+        k(h, s, c) = static_cast<int8_t>(-128 + ((s * 7 + c * 13) % 256));
+      }
+    }
+  }
+
+  runtime.ReshapeExternalTensor(q_shape, q.base(), graph.q_id)
+      .ReshapeExternalTensor(k_shape, k.base(), graph.k_id)
+      .ReshapeRuntime()
+      .SetupExternalTensor(scores.base(), graph.scores_id)
+      .InvokeRuntime();
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+  for (size_t h = 0; h < QuantizedScoresGraph::kHeads; ++h) {
+    for (size_t s = 0; s < kKeys; ++s) {
+      int32_t expected = 0;
+      for (size_t c = 0; c < QuantizedScoresGraph::kHead; ++c) {
+        expected += static_cast<int32_t>(q(h, 0, c)) * k(h, s, c);
+      }
+      EXPECT_EQ(scores(h, 0, s), expected) << "h=" << h << " s=" << s;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace ynn
