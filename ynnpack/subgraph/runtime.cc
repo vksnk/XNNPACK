@@ -381,36 +381,6 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
 //    the pipeline were processed.
 namespace {
 
-// Just a helper function to track information about loop levels.
-struct loop_level {
-  slinky::loop_id loop_id;
-  slinky::expr extent;
-  slinky::expr step;
-  bool step_is_required = false;
-};
-
-struct scheduling_data {
-  // Loop nest should be a pair of function and loop_id. This is in fact a
-  // tree, but for the sake of simplicity we store it as a set of pathes
-  // (loop nests in this case) from the root of the tree (outermost
-  // location) to a leaf node (the innermost loop of a given function). Loop
-  // nests for each of the functions scheduled so far with the indices
-  // pointing to the global loop nest. Loop nests can overlap with each
-  // other if functions are scheduled within the same loop (only prefixes,
-  // i.e. from the root of the loop nest to the most innermost common loop).
-  std::vector<int> loop_nest;
-  // Compute_at locations of a function -- this an index within a
-  // loop nest of a given function, i.e from root (0) to the innermost loop
-  // (loop_nest[f_index].back()).
-  int compute_at = 0;
-  // For each split of the function's scheduling_info (in the reversed,
-  // outermost-first order used during matching), whether it was matched to
-  // an existing loop of the nest. Matched splits become loops of the
-  // function this function was fused into; unmatched splits become the
-  // function's own loops.
-  std::vector<bool> split_matched;
-};
-
 // Prints the decisions made by the scheduler to stderr, for debugging. This
 // is the only place that formats or prints any of the scheduler's state;
 // schedule() calls it once when the YNN_DUMP_SCHEDULE environment variable is
@@ -593,6 +563,18 @@ void ynn_runtime::schedule() {
     return it != source_regions.end() ? it->second : -1;
   };
 
+  // Slinky never allocates the pipeline's output buffers, and as a result it
+  // also never crops them to the region a loop iteration needs. Fusing the
+  // producer of an external output into a loop of one of its consumers would
+  // therefore run the producer -- and everything it depends on -- over the
+  // whole output on *every* iteration of that loop.
+  std::set<slinky::var> external_output_syms;
+  for (const ynn_runtime_value& value : values) {
+    if (value.is_valid() && value.is_external_output()) {
+      external_output_syms.insert(value.symbol);
+    }
+  }
+
   for (int i = funcs.size() - 1; i >= 0; --i) {
     slinky::func& f = funcs[i];
     scheduling_data& sched_data = func_scheduling_data[i];
@@ -758,9 +740,21 @@ void ynn_runtime::schedule() {
       loop_nest.erase(loop_nest.begin() + compute_at, loop_nest.end());
     }
 
-    if (sched && sched->force_root) {
+    // A function producing an external output cannot be fused into a loop of
+    // its consumers without recomputing all of it on every iteration, see
+    // `external_output_syms` above.
+    const bool produces_external_output =
+        !loop_nest.empty() &&
+        std::any_of(f.outputs().begin(), f.outputs().end(),
+                    [&](const slinky::func::output& o) {
+                      return external_output_syms.count(o.buffer->sym()) > 0;
+                    });
+
+    if ((sched && sched->force_root) || produces_external_output) {
       compute_at = 0;
-      sched_data.split_matched.assign(sched->loop_splits.size(), false);
+      if (sched) {
+        sched_data.split_matched.assign(sched->loop_splits.size(), false);
+      }
       loop_nest.clear();
     }
 
