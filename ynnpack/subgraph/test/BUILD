@@ -359,6 +359,25 @@ cc_test(
 )
 
 cc_test(
+    name = "transformer_block_bench",
+    srcs = ["transformer_block_bench.cc"],
+    args = ["--benchmark_min_time=1x"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        ":scheduler",
+        ":subgraph_builder",
+        "//ynnpack",
+        "//ynnpack/base",
+        "//ynnpack/composites",
+    ] + ynn_benchmark_deps(),
+)
+
+cc_test(
     name = "reduce_bench",
     srcs = ["reduce_bench.cc"],
     args = ["--benchmark_min_time=1x"],

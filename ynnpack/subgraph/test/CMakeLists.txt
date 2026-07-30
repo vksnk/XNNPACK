@@ -109,6 +109,17 @@ IF(YNNPACK_BUILD_BENCHMARKS)
     benchmark::benchmark_main
   )
 
+  ADD_EXECUTABLE(ynnpack_subgraph_transformer_block_bench transformer_block_bench.cc)
+  TARGET_LINK_LIBRARIES(ynnpack_subgraph_transformer_block_bench
+    ynnpack
+    ynnpack_base
+    ynnpack_subgraph
+    ynnpack_composites
+    ynnpack_subgraph_test_builder
+    ynnpack_subgraph_test_scheduler
+    benchmark::benchmark_main
+  )
+
   ADD_EXECUTABLE(ynnpack_subgraph_dot_bench dot_bench.cc)
   TARGET_LINK_LIBRARIES(ynnpack_subgraph_dot_bench ynnpack ynnpack_base ynnpack_subgraph_test_scheduler benchmark::benchmark)
 
