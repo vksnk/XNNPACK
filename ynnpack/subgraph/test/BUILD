@@ -147,6 +147,7 @@ cc_test(
         "fusion_copy.cc",
         "fusion_lut.cc",
         "fusion_reduce.cc",
+        "fusion_dot_transpose.cc",
     ] + select({
         # This test assumes we can pattern match and use kernels, which are only guaranteed to exist
         # on x86, and the logic being tested is architecture independent.
