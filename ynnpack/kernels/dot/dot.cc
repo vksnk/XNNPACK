@@ -423,13 +423,16 @@ dot_kernel get_dot_kernel(const dot_shape& shape,
   return optimizer.result;
 }
 
-}  // namespace
-
-dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape,
-                          const dot_packed_shape* packed_shape,
-                          uint32_t required_flags,
-                          std::optional<bool> transpose_a,
-                          uint64_t arch_flags) {
+// Selects a kernel for `type`, reporting through `supported` whether there are
+// any kernels for this combination of types at all, so that a caller asking
+// whether a rewrite is possible does not look like an error.
+dot_kernel get_dot_kernel_for_types(const dot_type& type,
+                                    const dot_shape& shape,
+                                    const dot_packed_shape* packed_shape,
+                                    uint32_t required_flags,
+                                    std::optional<bool> transpose_a,
+                                    uint64_t arch_flags, bool& supported) {
+  supported = true;
   if (type.a == ynn_type_fp64 && type.b == ynn_type_fp64 &&
       type.c == ynn_type_fp64) {
     return get_dot_kernel<double, double, double>(
@@ -470,6 +473,10 @@ dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape,
              type.c == ynn_type_int32) {
     return get_dot_kernel<uint8_t, int8_t, int32_t>(
         shape, packed_shape, required_flags, transpose_a, arch_flags);
+  } else if (type.a == ynn_type_int8 && type.b == ynn_type_uint8 &&
+             type.c == ynn_type_int32) {
+    return get_dot_kernel<int8_t, uint8_t, int32_t>(
+        shape, packed_shape, required_flags, transpose_a, arch_flags);
   } else if (type.a == ynn_type_fp8_e5m2 && type.b == ynn_type_fp8_e5m2 &&
              type.c == ynn_type_fp32) {
     return get_dot_kernel<fp8_e5m2, fp8_e5m2, float>(
@@ -479,10 +486,36 @@ dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape,
     return get_dot_kernel<fp8_e4m3, fp8_e4m3, float>(
         shape, packed_shape, required_flags, transpose_a, arch_flags);
   } else {
-    YNN_LOG_ERROR() << "Unsupported dot type " << type.a << "_" << type.b << "_"
-                    << type.c;
+    supported = false;
     return {};
   }
+}
+
+}  // namespace
+
+dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape,
+                          const dot_packed_shape* packed_shape,
+                          uint32_t required_flags,
+                          std::optional<bool> transpose_a,
+                          uint64_t arch_flags) {
+  bool supported = false;
+  dot_kernel result =
+      get_dot_kernel_for_types(type, shape, packed_shape, required_flags,
+                               transpose_a, arch_flags, supported);
+  if (!supported) {
+    YNN_LOG_ERROR() << "Unsupported dot type " << type.a << "_" << type.b << "_"
+                    << type.c;
+  }
+  return result;
+}
+
+bool has_dot_kernel(const dot_type& type, uint64_t arch_flags) {
+  bool supported = false;
+  return get_dot_kernel_for_types(type, /*shape=*/{}, /*packed_shape=*/nullptr,
+                                  /*required_flags=*/0,
+                                  /*transpose_a=*/std::nullopt, arch_flags,
+                                  supported)
+             .kernel != nullptr;
 }
 
 }  // namespace ynn

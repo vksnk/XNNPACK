@@ -51,12 +51,22 @@ bool prefer_uint8_dot(ynn_type b_type) {
     return false;
   }
 
-  // Get the kernels we would use for both int8 and uint8.
-  dot_kernel int8 = get_dot_kernel({ynn_type_int8, b_type, ynn_type_int32});
-  dot_kernel uint8 = get_dot_kernel({ynn_type_uint8, b_type, ynn_type_int32});
+  // Get the kernels we would use for both int8 and uint8. Having no kernels at
+  // all for one of these combinations of types is an answer to the question
+  // being asked here, not an error, so ask before selecting.
+  const dot_type int8_type = {ynn_type_int8, b_type, ynn_type_int32};
+  const dot_type uint8_type = {ynn_type_uint8, b_type, ynn_type_int32};
+  if (!has_dot_kernel(uint8_type)) {
+    return false;
+  }
+  dot_kernel uint8 = get_dot_kernel(uint8_type);
   if (!uint8.kernel) {
     return false;
   }
+  if (!has_dot_kernel(int8_type)) {
+    return true;
+  }
+  dot_kernel int8 = get_dot_kernel(int8_type);
   if (!int8.kernel) {
     return true;
   }

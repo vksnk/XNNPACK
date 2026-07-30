@@ -94,6 +94,7 @@ py_library(
     "x86_int8_int8_int32",
     "x86_int8_int8_int32_k1",
     "x86_int8_int8_int32_k16",
+    "x86_int8_uint8_int32",
     "x86_uint8_int8_int32",
     "x86_uint8_int8_int32_k16",
     "x86_uint8_int2_int32",

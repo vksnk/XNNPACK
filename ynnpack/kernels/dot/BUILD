@@ -250,6 +250,16 @@ ynn_generate_srcs(
 )
 
 ynn_generate_srcs(
+    name = "x86_int8_uint8_int32",
+    compatible_with = _COMPATIBLE_WITH,
+    generator = "//ynnpack/kernels/dot/generator:x86_int8_uint8_int32",
+    output_srcs = [
+        "x86_avx512vnni_int8_uint8_int32.cc",
+        "x86_avx512vnni_int8_uint8_int32.inc",
+    ],
+)
+
+ynn_generate_srcs(
     name = "x86_uint8_int8_int32",
     compatible_with = _COMPATIBLE_WITH,
     generator = "//ynnpack/kernels/dot/generator:x86_uint8_int8_int32",
@@ -412,6 +422,7 @@ ynn_cc_library(
         "x86_avx512_uint8_int2_int32.inc",
         "x86_avx512_uint8_int4_int32.inc",
         "x86_avx512bf16_bf16_bf16_fp32.inc",
+        "x86_avx512vnni_int8_uint8_int32.inc",
         "x86_avx512vnni_uint8_int2_int32.inc",
         "x86_avx512vnni_uint8_int4_int32.inc",
         "x86_avx512vnni_uint8_int8_int32.inc",
@@ -499,6 +510,7 @@ ynn_cc_library(
         ],
         "x86_avx512bf16": ["x86_avx512bf16_bf16_bf16_fp32.cc"],
         "x86_avx512vnni": [
+            "x86_avx512vnni_int8_uint8_int32.cc",
             "x86_avx512vnni_uint8_int2_int32.cc",
             "x86_avx512vnni_uint8_int4_int32.cc",
             "x86_avx512vnni_uint8_int8_int32.cc",
