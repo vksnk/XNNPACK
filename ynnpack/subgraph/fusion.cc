@@ -2242,6 +2242,132 @@ bool rewrite_sum_to_dot(ynn_subgraph& subgraph, ynn_node& node,
   return true;
 }
 
+// Rewrite dot(a, transpose(b)) to transpose(dot(b, transpose(a))) when `a` has
+// a single row.
+//
+// `b` is usually far bigger than `a` -- an attention key cache against a single
+// query token -- and transposing it copies the whole thing on every call. Used
+// as the dot's `a` operand instead it needs no copy at all, because it already
+// has the reduction dimension innermost. The two transposes that remain are of
+// a dimension of extent 1, so they are only a change of metadata.
+bool rewrite_dot_of_transpose(ynn_subgraph& subgraph, ynn_node& node,
+                              subgraph_analysis& analysis) {
+  const ynn_node::dot* dot = std::get_if<ynn_node::dot>(&node.op);
+  if (dot == nullptr) return false;
+  if (dot->num_k_dims != 1) return false;
+
+  const uint32_t a_id = node.inputs[0];
+  uint32_t b_transposed_id = node.inputs[1];
+  if (a_id == YNN_INVALID_VALUE_ID ||
+      b_transposed_id == YNN_INVALID_VALUE_ID) {
+    return false;
+  }
+
+  // Only the value feeding the dot is used by it, otherwise the work we are
+  // removing is needed anyway.
+  auto has_one_consumer = [&](uint32_t id) {
+    return analysis.consumers[id].size() == 1 &&
+           !subgraph.value(id).is_external_output();
+  };
+  if (!has_one_consumer(b_transposed_id)) return false;
+
+  auto producer = analysis.producers.find(b_transposed_id);
+  if (producer == analysis.producers.end()) {
+    return false;
+  }
+  // The transpose is only a view; what actually copies the operand is the
+  // pack the dot puts between them, so look through it.
+  if (std::holds_alternative<ynn_node::pack_b>(producer->second->op)) {
+    b_transposed_id = producer->second->inputs[0];
+    if (!has_one_consumer(b_transposed_id)) {
+      return false;
+    }
+    producer = analysis.producers.find(b_transposed_id);
+    if (producer == analysis.producers.end()) {
+      return false;
+    }
+  }
+  ynn_node& transpose_node = *producer->second;
+  const ynn_node::static_transpose* transpose =
+      std::get_if<ynn_node::static_transpose>(&transpose_node.op);
+  if (transpose == nullptr) return false;
+
+  if (node.inputs.size() > 2 && node.inputs[2] != YNN_INVALID_VALUE_ID) {
+    return false;
+  }
+  const uint32_t b_id = transpose_node.inputs[0];
+  const ynn_value& a = subgraph.value(a_id);
+  const ynn_value& b = subgraph.value(b_id);
+  if (a.rank() < 2 || a.rank() != b.rank()) return false;
+
+  // Only a swap of the reduction dimension with the one next to it, which is
+  // the last two dimensions of the tensor as the caller sees it.
+  if (transpose->permutation.size() != b.rank()) {
+    return false;
+  }
+  for (size_t d = 0; d < transpose->permutation.size(); ++d) {
+    const int32_t expected =
+        d == 0 ? 1 : (d == 1 ? 0 : static_cast<int32_t>(d));
+    if (transpose->permutation[d] != expected) return false;
+  }
+
+  // Only worth it when transposing `a` and the result is much cheaper than
+  // packing `b`: `a` is m*k elements and the result is m*n, against n*k for
+  // the pack. Attention against a key cache has a small m (the query heads
+  // sharing a key head) and a large n (the cached keys), so it wins by a wide
+  // margin; a prefill, whose m is the whole token block, does not.
+  auto constant_extent = [](const ynn_value& v, int d) -> int64_t {
+    std::optional<slinky::index_t> c = slinky::as_constant(v.extent(d));
+    return c ? static_cast<int64_t>(*c) : -1;
+  };
+  const int64_t m = constant_extent(a, 1);
+  const int64_t k = constant_extent(a, 0);
+  const int64_t n = constant_extent(b, 1);
+  if (m < 0 || k < 0 || n < 0) return false;
+  if (m * (k + n) * 4 > n * k) return false;
+  // With a single row both of the transposes we are about to make are only a
+  // change of metadata; with more than one they are (small) copies.
+  const bool transposes_are_free = m == 1;
+  // Integer dots carry quantization through rewrites that inspect which
+  // operand is which, so leave those alone.
+  if (ynn::type_is_integral(a.type) || ynn::type_is_integral(b.type)) return false;
+  // Swapping the operands swaps which one broadcasts, so the batch dimensions
+  // have to agree already.
+  for (size_t d = 2; d < a.rank(); ++d) {
+    if (!slinky::prove_true(a.extent(d) == b.extent(d))) {
+      return false;
+    }
+  }
+
+  std::vector<int32_t> swap_k(a.rank());
+  std::iota(swap_k.begin(), swap_k.end(), 0);
+  std::swap(swap_k[0], swap_k[1]);
+
+  // Reuse the node that transposed `b` to transpose `a` instead. `a` has a
+  // single row, so this is an alias.
+  uint32_t a_transposed_id = YNN_INVALID_VALUE_ID;
+  define_static_transpose(subgraph, transpose_node, swap_k, a_id,
+                          &a_transposed_id, transposes_are_free);
+
+  uint32_t dot_id = YNN_INVALID_VALUE_ID;
+  ynn_define_dot(&subgraph, /*num_k_dims=*/1, b_id, a_transposed_id,
+                 /*input_c_id=*/YNN_INVALID_VALUE_ID, &dot_id, /*flags=*/0);
+
+  uint32_t output_id = node.outputs[0];
+  node.invalidate();
+
+  // And put the result back in the layout the consumers expect. Its rows are
+  // the single row of `a`, so this is an alias too.
+  ynn_node output_transpose;
+  define_static_transpose(subgraph, output_transpose, std::move(swap_k), dot_id,
+                          &output_id, transposes_are_free);
+  subgraph.add_node(std::move(output_transpose));
+
+  subgraph.topological_sort();
+  analysis.invalidate();
+  return true;
+}
+
 bool rewrite_fast_math(ynn_subgraph& subgraph, ynn_node& node,
                        subgraph_analysis& analysis) {
   if ((subgraph.flags & YNN_FLAG_FAST_MATH) == 0) return false;
@@ -2371,6 +2497,7 @@ ynn_status ynn_subgraph::fusion() {
                 ynn::rewrite_reduce_sum_of_squared(*this, node, analysis) ||
                 ynn::rewrite_reduce_convert(*this, node, analysis) ||
                 ynn::rewrite_reduce_static_transpose(*this, node, analysis) ||
+                ynn::rewrite_dot_of_transpose(*this, node, analysis) ||
                 ynn::rewrite_fast_math(*this, node, analysis) ||
                 ynn::rewrite_requantize_quantize(*this, node, analysis) ||
                 false;
