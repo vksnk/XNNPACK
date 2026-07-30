@@ -318,6 +318,18 @@ enum ynn_status ynn_define_binary(ynn_subgraph_t subgraph,
                                   uint32_t input_a_id, uint32_t input_b_id,
                                   uint32_t* output_id, uint32_t flags);
 
+// Defines an elementwise select: `output = condition ? input_true :
+// input_false`. `condition_id` must be a `ynn_type_uint8` tensor, where a
+// non-zero value selects `input_true` (this is how boolean tensors are
+// represented, and what the comparison operators produce). The two value
+// tensors must have the same type, which is also the type of the output.
+// The inputs are broadcast against each other like `ynn_define_binary`.
+enum ynn_status ynn_define_select(ynn_subgraph_t subgraph,
+                                  uint32_t condition_id,
+                                  uint32_t input_true_id,
+                                  uint32_t input_false_id, uint32_t* output_id,
+                                  uint32_t flags);
+
 // Defines a gather operation. This computes:
 //
 //   output[i, j, k, ...] = input[

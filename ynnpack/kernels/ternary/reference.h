@@ -118,6 +118,18 @@ struct dequantize {
   }
 };
 
+// `a ? b : c`, where `a` is a uint8 and any non-zero value is true.
+struct select {
+  float operator()(uint8_t a, float b, float c) const { return a ? b : c; }
+  int32_t operator()(uint8_t a, int32_t b, int32_t c) const {
+    return a ? b : c;
+  }
+
+  double tolerance(double a, double b, double c, ynn_type type) const {
+    return 0.0;
+  }
+};
+
 
 // Check that `op(a, b, c)` == x, within tolerances described by `op`.
 template <typename A, typename B, typename C, typename X, typename OpInfo>

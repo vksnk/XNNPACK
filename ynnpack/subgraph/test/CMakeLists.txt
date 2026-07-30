@@ -61,6 +61,7 @@ YNN_ADD_SUBGRAPH_TEST(utils)
 YNN_ADD_SUBGRAPH_TEST(polynomial)
 YNN_ADD_SUBGRAPH_TEST(partial_reduce_dot)
 YNN_ADD_SUBGRAPH_TEST(sub_byte_types)
+YNN_ADD_SUBGRAPH_TEST(select)
 
 YNN_ADD_SUBGRAPH_TEST(binary)
 TARGET_LINK_LIBRARIES(ynnpack_subgraph_binary_test ynnpack_kernels_binary_reference)

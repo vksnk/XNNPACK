@@ -60,6 +60,7 @@ def main(argv: Sequence[str]) -> None:
           (quantize_bf16_to_uint8, (32, 1)),
           (quantize_fp32_to_int8, (32, 1)),
           (quantize_fp32_to_uint8, (32, 1)),
+          (select_uint8_fp32_fp32, (32, 1)),
           (subtract_multiply_int32_int32_int32, (16, 1)),
           # go/keep-sorted end
       ],
@@ -83,6 +84,8 @@ def main(argv: Sequence[str]) -> None:
           (quantize_fp16_to_uint8, (64, 1)),
           (quantize_fp32_to_int8, (64, 1)),
           (quantize_fp32_to_uint8, (64, 1)),
+          (select_uint8_fp32_fp32, (64, 1)),
+          (select_uint8_int32_int32, (64, 1)),
           (subtract_multiply_int32_int32_int32, (32, 1)),
           # go/keep-sorted end
       ],
@@ -113,6 +116,8 @@ def main(argv: Sequence[str]) -> None:
           (quantize_bf16_to_int8, (16, 1)),
           (quantize_bf16_to_uint8, (16, 1)),
           (quantize_fp32_to_int8, (16, 1)),
+          (select_uint8_fp32_fp32, (16, 1)),
+          (select_uint8_int32_int32, (16, 1)),
           (subtract_multiply_int32_int32_int32, (8, 1)),
           # go/keep-sorted end
       ],

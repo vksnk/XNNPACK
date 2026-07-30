@@ -122,6 +122,14 @@ cc_test(
 )
 
 cc_test(
+    name = "select",
+    srcs = ["select.cc"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = TEST_DEPS,
+)
+
+cc_test(
     name = "unary",
     srcs = ["unary.cc"],
     linkopts = ynn_binary_linkopts(),
