@@ -4,6 +4,9 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <cstdint>
+#include <memory>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include "ynnpack/base/test/util.h"
@@ -65,4 +68,114 @@ TEST(runtime, dot_concurrency) {
   ASSERT_GT(get_concurrency(dynamic), 1);
 }
 #endif
+
+// Runtimes that share a cached pipeline must be able to run concurrently:
+// they share the (immutable, reference counted) pipeline body, but each has
+// its own constants, external buffers, and evaluation context.
+TEST(runtime, pipeline_cache_concurrent_invoke) {
+  constexpr uint32_t in_id = 0;
+  constexpr uint32_t out_id = 1;
+  constexpr size_t m = 32, k = 16;
+  constexpr int num_runtimes = 4;
+  constexpr int num_invokes = 20;
+
+  std::vector<float> input(m * k);
+  for (size_t i = 0; i < input.size(); ++i) {
+    input[i] = static_cast<float>(i % 11) - 5.0f;
+  }
+
+  std::vector<std::unique_ptr<SubgraphBuilder>> builders;
+  std::vector<std::unique_ptr<Runtime>> runtimes;
+  std::vector<float> scales;
+  for (int r = 0; r < num_runtimes; ++r) {
+    scales.push_back(1.0f + r);
+    auto builder = std::make_unique<SubgraphBuilder>(2);
+    builder->AddInput(type_of<float>(), {m, k}, in_id);
+    builder->AddOutput(type_of<float>(), {m, k}, out_id);
+    builder->AddBinary(ynn_binary_multiply, in_id,
+                       builder->DefineScalar(scales.back()), out_id);
+    auto runtime = std::make_unique<Runtime>(builder->GetSubgraph());
+    ASSERT_EQ(runtime->Status(), ynn_status_success);
+    runtime->ReshapeExternalTensor({m, k}, input.data(), in_id)
+        .ReshapeRuntime();
+    builders.push_back(std::move(builder));
+    runtimes.push_back(std::move(runtime));
+  }
+
+  std::vector<std::vector<float>> outputs(num_runtimes,
+                                          std::vector<float>(m * k, 0.0f));
+  std::vector<std::thread> threads;
+  for (int r = 0; r < num_runtimes; ++r) {
+    threads.emplace_back([&, r]() {
+      runtimes[r]->SetupExternalTensor(outputs[r].data(), out_id);
+      for (int i = 0; i < num_invokes; ++i) {
+        runtimes[r]->InvokeRuntime();
+      }
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+
+  for (int r = 0; r < num_runtimes; ++r) {
+    ASSERT_EQ(runtimes[r]->Status(), ynn_status_success);
+    for (size_t i = 0; i < input.size(); ++i) {
+      ASSERT_EQ(outputs[r][i], input[i] * scales[r]) << "r=" << r << " i=" << i;
+    }
+  }
+}
+
+// Structurally identical subgraphs share a cached pipeline, with each runtime
+// rebinding the pipeline's constants to its own static buffers. Run several
+// such subgraphs that differ only in the contents of their constants and
+// check that each one computes with its own data, not the data of the
+// runtime that populated the cache.
+TEST(runtime, pipeline_cache_rebinds_constants) {
+  constexpr uint32_t in_id = 0;
+  constexpr uint32_t out_id = 1;
+  constexpr size_t m = 4, k = 8, n = 3;
+
+  for (int trial = 0; trial < 3; ++trial) {
+    std::vector<float> weights(n * k);
+    float scale = 0.5f + trial;
+    for (size_t i = 0; i < weights.size(); ++i) {
+      weights[i] = static_cast<float>(trial * 100 + i);
+    }
+
+    uint32_t weights_id = YNN_INVALID_VALUE_ID;
+    uint32_t dot_id = YNN_INVALID_VALUE_ID;
+    SubgraphBuilder builder(2);
+    builder.AddInput(type_of<float>(), {m, k}, in_id);
+    builder.AddOutput(type_of<float>(), {m, n}, out_id);
+    builder.AddTensor(type_of<float>(), {k, n}, weights_id, weights.data());
+    builder.AddTensor(type_of<float>(), {m, n}, dot_id);
+    builder.AddDot(1, in_id, weights_id, YNN_INVALID_VALUE_ID, dot_id);
+    builder.AddBinary(ynn_binary_multiply, dot_id, builder.DefineScalar(scale),
+                      out_id);
+
+    std::vector<float> input(m * k);
+    for (size_t i = 0; i < input.size(); ++i) {
+      input[i] = static_cast<float>(i % 7) - 3.0f;
+    }
+    std::vector<float> output(m * n, 0.0f);
+
+    Runtime runtime(builder.GetSubgraph());
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+    runtime.ReshapeExternalTensor({m, k}, input.data(), in_id)
+        .ReshapeRuntime();
+    runtime.SetupExternalTensor(output.data(), out_id).InvokeRuntime();
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+    for (size_t i = 0; i < m; ++i) {
+      for (size_t j = 0; j < n; ++j) {
+        float expected = 0.0f;
+        for (size_t l = 0; l < k; ++l) {
+          expected += input[i * k + l] * weights[l * n + j];
+        }
+        expected *= scale;
+        ASSERT_NEAR(output[i * n + j], expected, 1e-3f)
+            << "trial=" << trial << " i=" << i << " j=" << j;
+      }
+    }
+  }
+}
+
 }  // namespace ynn

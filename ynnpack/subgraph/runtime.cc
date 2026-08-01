@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -35,6 +36,7 @@
 #include "ynnpack/base/span.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/reduce.h"
 #include "ynnpack/subgraph/slinky.h"
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/tensor.h"
@@ -48,6 +50,7 @@
 #include "slinky/runtime/depends_on.h"
 #include "slinky/runtime/evaluate.h"
 #include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
 #include "slinky/runtime/stmt.h"
 
 void ynn_runtime_value::make_buffer(ynn_runtime& runtime,
@@ -789,6 +792,321 @@ bool ynn_traceme_enabled() {
 }
 #endif
 
+// Models commonly contain many structurally identical subgraphs (e.g. the
+// layers of a transformer) that differ only in the static buffers they point
+// at, and `slinky::build_pipeline` dominates the cost of creating a runtime.
+// We cache built pipelines in a process-wide table, keyed by everything that
+// influences the build except the contents of static buffers, and on a hit
+// only rebind the `constant_buffer` stmts to the new runtime's buffers.
+//
+// Reuse is only sound if the key really covers everything the build depends
+// on, and slinky makes that subtler than it looks. The pitfalls, and how each
+// is handled:
+//
+// 1. Symbol identity. A cached body refers to values by slinky::var id, so a
+//    hit must guarantee this runtime assigns the same ids to the same things.
+//    Rather than proving that, the key makes it true by construction: it
+//    prints every value's raw symbol id (and every extent/let expr with raw
+//    ids, via slinky's default printer, which has no naming context). Two
+//    runtimes whose symbol numbering diverges anywhere simply produce
+//    different keys and miss. In practice identical subgraphs allocate
+//    identical ids because the runtime constructor and node create() calls
+//    visit values in the same order.
+//
+// 2. Content specialization. The build is *supposed* to be independent of
+//    static buffer contents, but slinky's simplifier specializes on content
+//    EQUALITY between small constants: a constant buffer under 256 bytes
+//    that compares equal to another in-scope constant is substituted away
+//    (simplify.cc), and the expression matcher compares small constant
+//    contents too (substitute.cc). Example: an int8 dot whose zero point
+//    happens to equal the reduction identity (0) builds a structurally
+//    different pipeline than one whose zero point is 6. The key therefore
+//    includes the *equality pattern* of small static buffers -- see
+//    make_pipeline_cache_key -- but not their contents, so runtimes that
+//    differ only in the values of pairwise-distinct small constants (e.g.
+//    quantization scales) still share.
+//
+// 3. Materialized constants. The simplifier can bake a *copy* of static
+//    buffer contents into the body (e.g. fold_slice_of_const_buffer copies
+//    the data of a constant-coordinate slice of a constant). Such a body is
+//    specialized to the inserting runtime's contents and must not be shared;
+//    rebinding wouldn't reach these copies because they aren't bound by the
+//    runtime's own constant_buffer stmts. can_cache_pipeline rejects any
+//    body containing a constant_buffer that is neither a rebindable static
+//    value nor one of the content-independent buffers the build itself
+//    creates.
+//
+// 4. Stale buffer references. Cached entries hold the body with placeholder
+//    (rank-0, empty) buffers substituted for the inserting runtime's static
+//    buffers, so the cache does not keep that runtime's weights alive, and
+//    accidentally evaluating an un-rebound cached pipeline fails loudly
+//    instead of silently reading freed memory.
+//
+// 5. Everything else that shapes the build -- runtime flags, the thread
+//    count the schedule was computed for, node ops with all their
+//    parameters, the global lets -- is printed into the key directly.
+//
+// Any new way the build comes to depend on something the key does not cover
+// would surface as a miscompiled reuse, so when extending the builder or the
+// key, keep the two in sync: everything the build reads must be printed into
+// the key, and anything that can't be must make the key empty (uncacheable).
+
+struct pipeline_cache {
+  std::mutex mutex;
+  // Interns each distinct node op (including its parameters, via the variant's
+  // operator<) as a small integer for use in cache keys.
+  std::map<decltype(ynn_node::op), int> op_ids;
+  std::map<std::string, slinky::pipeline> pipelines;
+
+  static pipeline_cache& global() {
+    static pipeline_cache* instance = new pipeline_cache();
+    return *instance;
+  }
+};
+
+// Returns true if `a` and `b` are equal the way slinky's simplifier compares
+// constants: same rank, elem_size and dims, with equal contents. This must
+// match slinky's buffers_equal exactly -- it decides which runtimes are
+// allowed to share a pipeline in the face of the simplifier's content-equality
+// specialization (point 2 of the overview above).
+bool buffers_equal(const slinky::raw_buffer& a, const slinky::raw_buffer& b) {
+  if (a.rank != b.rank || a.elem_size != b.elem_size) return false;
+  for (size_t d = 0; d < a.rank; ++d) {
+    if (a.dim(d) != b.dim(d)) return false;
+  }
+  bool equal = true;
+  slinky::for_each_contiguous_slice(
+      a,
+      [&](slinky::index_t extent, const void* a_base, const void* b_base) {
+        equal = equal && memcmp(a_base, b_base, extent * a.elem_size) == 0;
+      },
+      b);
+  return equal;
+}
+
+// Returns a key identifying the pipeline `build()` produces, up to the
+// contents of static buffers, or an empty string if this runtime cannot be
+// cached. Symbols (and symbols inside exprs) are printed as raw ids, so equal
+// keys imply the cached pipeline's symbols mean the same thing in this
+// runtime. This makes reuse safe by construction: any divergence, including a
+// different symbol numbering, produces a different key and just misses.
+std::string make_pipeline_cache_key(const ynn_runtime& runtime,
+                                    int max_threads,
+                                    const slinky::build_options& options) {
+  // Tracing embeds a names buffer whose contents the key doesn't cover;
+  // traced builds aren't worth caching anyway.
+  if (options.trace) return {};
+  std::stringstream key;
+  // The flags affect scheduling (e.g. YNN_RUNTIME_FLAG_NO_SCHEDULE), and the
+  // schedule's split factors are computed for a specific thread count.
+  key << runtime.flags << ' ' << max_threads << '\n';
+  for (const ynn_runtime_value& value : runtime.values) {
+    if (!value.is_valid()) continue;
+    // `value.symbol.id` is the raw var id and `extent` prints ids without a
+    // naming context: this is what pins the symbol numbering (point 1 of the
+    // overview).
+    key << value.id << ' ' << value.type << ' '
+        << (value.flags & (YNN_VALUE_FLAG_EXTERNAL_INPUT |
+                           YNN_VALUE_FLAG_EXTERNAL_OUTPUT))
+        << ' ' << value.symbol.id << " {";
+    for (const slinky::expr& extent : value.extents) {
+      key << extent << ',';
+    }
+    key << '}';
+    if (value.is_static()) {
+      // The full metadata of a static buffer (dims, strides, folding) is
+      // baked into the built pipeline; only the data pointer is effectively
+      // rebound on reuse. Two constants with equal shapes but different
+      // strides must therefore miss.
+      key << " static " << value.data->elem_size;
+      for (size_t d = 0; d < value.data->rank; ++d) {
+        const slinky::dim& dim = value.data->dim(d);
+        key << " [" << dim.min() << ' ' << dim.extent() << ' ' << dim.stride()
+            << ' ' << dim.fold_factor() << ']';
+      }
+    }
+    key << '\n';
+  }
+  // The lock protects op_ids (this function is the only writer). It is held
+  // through the rest of key construction, which only reads this runtime.
+  pipeline_cache& cache = pipeline_cache::global();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  for (const ynn_node& node : runtime.subgraph->nodes) {
+    if (!node.is_valid()) continue;
+    if (std::holds_alternative<ynn_node::opaque>(node.op)) {
+      // An opaque node's create callback can depend on state the key can't
+      // see.
+      return {};
+    }
+    // A node's create() behavior is determined by its op variant, including
+    // all embedded parameters (via the variant's operator<). Interning each
+    // distinct op as a small integer keeps the key short; the interning table
+    // is process-global and append-only, so ids are stable for the process
+    // lifetime.
+    auto op_id =
+        cache.op_ids.emplace(node.op, static_cast<int>(cache.op_ids.size()))
+            .first;
+    key << op_id->second << " <-";
+    for (uint32_t i : node.inputs) key << ' ' << i;
+    key << " ->";
+    for (uint32_t i : node.outputs) key << ' ' << i;
+    key << '\n';
+  }
+  for (const auto& let : runtime.globals.lets) {
+    key << let.first.id << '=' << let.second << '\n';
+  }
+
+  // The builder specializes on content *equality* between small constants:
+  // slinky's simplifier substitutes a constant under 256 bytes that compares
+  // equal to another in-scope constant (e.g. a zero point that happens to
+  // equal a reduction identity). Constants of at least 256 bytes are only
+  // ever compared by pointer, which distinct buffers never match. So the key
+  // includes the equality pattern of the small static buffers: which of them
+  // equal each other, and which equal the content-independent constants the
+  // build creates (the reduction identities; the zero padding scalar is
+  // covered by the all-zero bit together with the already keyed metadata).
+  // The contents themselves stay out of the key, so runtimes that differ
+  // only in the values of pairwise-distinct small constants still share a
+  // pipeline.
+  //
+  // Each small static contributes one line: the index of the first earlier
+  // small static with equal contents (-1 if none) -- a canonical encoding of
+  // the pairwise-equality relation -- the all-zero bit, and one equality bit
+  // per reduce node's identity buffer. The identity buffers are recomputed
+  // here exactly as the reduce create() computes them, because that is the
+  // in-scope constant a static most plausibly collides with (the observed
+  // failure was an int8 dot whose zero point of 0 equaled the sum-reduction
+  // identity, folding differently than a nonzero zero point).
+  std::vector<const slinky::raw_buffer*> small_statics;
+  for (const ynn_runtime_value& value : runtime.values) {
+    if (!value.is_valid() || !value.is_static()) continue;
+    if (value.data->size_bytes() < 256) {
+      small_statics.push_back(value.data.get());
+    }
+  }
+  std::vector<slinky::raw_buffer_ptr> identities;
+  for (const ynn_node& node : runtime.subgraph->nodes) {
+    if (!node.is_valid()) continue;
+    if (const ynn_node::reduce* op = std::get_if<ynn_node::reduce>(&node.op)) {
+      const ynn_runtime_value& output = runtime.value(node.outputs[0]);
+      identities.push_back(
+          ynn::make_reduce_identity(output.type, output.rank(), op->op));
+    }
+  }
+  for (size_t i = 0; i < small_statics.size(); ++i) {
+    const slinky::raw_buffer& buffer = *small_statics[i];
+    int first_equal = -1;
+    for (size_t j = 0; j < i; ++j) {
+      if (buffers_equal(*small_statics[j], buffer)) {
+        first_equal = static_cast<int>(j);
+        break;
+      }
+    }
+    bool all_zero = true;
+    slinky::for_each_contiguous_slice(
+        buffer, [&](slinky::index_t extent, const void* base) {
+          for (slinky::index_t n = 0; n < extent * buffer.elem_size; ++n) {
+            all_zero = all_zero && static_cast<const char*>(base)[n] == 0;
+          }
+        });
+    key << first_equal << ' ' << all_zero;
+    for (const slinky::raw_buffer_ptr& identity : identities) {
+      key << ' ' << buffers_equal(*identity, buffer);
+    }
+    key << '\n';
+  }
+  return key.str();
+}
+
+// Replaces the buffers bound by `constant_buffer` stmts according to
+// `replacements`.
+slinky::stmt replace_constant_buffers(
+    const slinky::stmt& body,
+    const std::map<slinky::var, slinky::const_raw_buffer_ptr>& replacements) {
+  class mutator : public slinky::stmt_mutator {
+   public:
+    const std::map<slinky::var, slinky::const_raw_buffer_ptr>& replacements;
+
+    explicit mutator(
+        const std::map<slinky::var, slinky::const_raw_buffer_ptr>& replacements)
+        : replacements(replacements) {}
+
+    void visit(const slinky::constant_buffer* op) override {
+      slinky::stmt body = mutate(op->body);
+      auto it = replacements.find(op->sym);
+      if (it == replacements.end() && body.same_as(op->body)) {
+        set_result(op);
+      } else {
+        set_result(slinky::constant_buffer::make(
+            op->sym, it != replacements.end() ? it->second : op->value,
+            std::move(body)));
+      }
+    }
+  };
+  return mutator(replacements).mutate(body);
+}
+
+// The static buffers of `values`, keyed by their symbol. With `placeholders`,
+// empty buffers are used instead of the real ones, so the cache doesn't keep
+// the inserting runtime's buffers alive (and so that evaluating a cached
+// pipeline without rebinding fails loudly instead of silently reusing them).
+std::map<slinky::var, slinky::const_raw_buffer_ptr> static_buffer_bindings(
+    const std::vector<ynn_runtime_value>& values, bool placeholders) {
+  std::map<slinky::var, slinky::const_raw_buffer_ptr> bindings;
+  for (const ynn_runtime_value& value : values) {
+    if (!value.is_valid() || !value.is_static()) continue;
+    bindings[value.symbol] = placeholders
+                                 ? slinky::raw_buffer::make(0, 0)
+                                 : slinky::const_raw_buffer_ptr(value.data);
+  }
+  return bindings;
+}
+
+// Returns true if every constant_buffer in `body` is either a static value of
+// the runtime (rebindable by symbol on reuse) or one of the
+// content-independent constants created during the build. Anything else can
+// be a copy of static buffer contents materialized by the simplifier (see
+// slinky's fold_slice_of_const_buffer), which would be incorrect to share.
+bool can_cache_pipeline(
+    const slinky::stmt& body,
+    const std::map<slinky::var, slinky::const_raw_buffer_ptr>& static_bindings,
+    const slinky::node_context& symbols) {
+  class visitor : public slinky::recursive_node_visitor {
+   public:
+    const std::map<slinky::var, slinky::const_raw_buffer_ptr>& static_bindings;
+    const slinky::node_context& symbols;
+    bool result = true;
+
+    visitor(const std::map<slinky::var, slinky::const_raw_buffer_ptr>&
+                static_bindings,
+            const slinky::node_context& symbols)
+        : static_bindings(static_bindings), symbols(symbols) {}
+
+    void visit(const slinky::constant_buffer* op) override {
+      if (static_bindings.count(op->sym) == 0) {
+        // Strip the "#N" disambiguator added by insert_unique.
+        std::string name = symbols.name(op->sym);
+        name = name.substr(0, name.find('#'));
+        // These are the buffers ynnpack's node create() implementations make
+        // from scratch, with contents determined by the op alone (reduction
+        // identities, zero padding, null placeholders), plus slinky's trace
+        // names table. They are covered by the key via the ops, so sharing
+        // them is fine. Anything else is unrecognized and conservatively
+        // rejected -- most likely a content copy the simplifier materialized
+        // from a static buffer (point 3 of the overview). A rejected
+        // pipeline still works for its own runtime; it just isn't inserted.
+        if (name != "identity" && name != "zero" && name != "null" &&
+            name != "__trace_names") {
+          result = false;
+        }
+      }
+      slinky::recursive_node_visitor::visit(op);
+    }
+  } v(static_bindings, symbols);
+  if (body.defined()) body.accept(&v);
+  return v.result;
+}
+
 }  // namespace
 
 extern "C" {
@@ -888,6 +1206,72 @@ ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
 
 // This function takes the subgraph and turns it into a slinky pipeline.
 ynn_status ynn_runtime::build() {
+  slinky::build_options options;
+#ifdef YNN_ENABLE_PERFETTO
+  options.trace = options.trace || get_trace_filename() != nullptr;
+#endif
+#ifdef YNN_ENABLE_TSL_PROFILER
+  options.trace = options.trace || ynn_traceme_enabled();
+#endif
+#ifdef NDEBUG
+  options.no_checks = true;
+#endif
+
+  const int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
+  const std::string cache_key =
+      make_pipeline_cache_key(*this, max_threads, options);
+
+  pipeline_cache& cache = pipeline_cache::global();
+  slinky::pipeline cached_pipeline;
+  bool cache_hit = false;
+  if (!cache_key.empty()) {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto it = cache.pipelines.find(cache_key);
+    if (it != cache.pipelines.end()) {
+      cached_pipeline = it->second;
+      cache_hit = true;
+    }
+  }
+
+  if (cache_hit) {
+    // The cached pipeline is identical to the one we would build (same
+    // structure AND same symbol ids, guaranteed by the key), except its
+    // constant_buffers hold placeholders; rebind them to this runtime's
+    // static buffers. Then mirror the external output handling of the build
+    // path below: outputs need raw_buffers for reshape/setup to write into,
+    // with broadcast dims where the extent is 1 or undefined, exactly as the
+    // node create() loop would have set up.
+    cached_pipeline.body = replace_constant_buffers(
+        cached_pipeline.body,
+        static_buffer_bindings(values, /*placeholders=*/false));
+    for (ynn_runtime_value& value : values) {
+      if (!value.is_valid()) continue;
+      if (value.is_external_output() &&
+          (!value.data || value.data->rank != value.rank())) {
+        assert(value.buffer && value.buffer->elem_size().defined());
+        value.data = slinky::raw_buffer::make(
+            value.rank(), *as_constant(value.buffer->elem_size()));
+      }
+      if (value.data) {
+        for (size_t d = 0; d < value.extents.size(); ++d) {
+          if (!value.extents[d].defined() ||
+              slinky::is_constant(value.extents[d], 1)) {
+            value.data->mutable_dim(d) = slinky::dim::broadcast();
+          }
+        }
+      }
+    }
+
+    pipeline = std::move(cached_pipeline);
+
+    slinky::call_stmt::attributes attrs;
+    attrs.name = "ynn_reshape_runtime";
+    reshape_impl = slinky::let_stmt::make(
+        globals.lets, slinky::call_stmt::make(make_reshape_impl(this), {}, {},
+                                              {}, std::move(attrs)));
+    return ynn_status_success;
+  }
+
   std::vector<slinky::buffer_expr_ptr> inputs;
   std::vector<slinky::buffer_expr_ptr> outputs;
   funcs.clear();
@@ -948,19 +1332,19 @@ ynn_status ynn_runtime::build() {
     schedule();
   }
 
-  slinky::build_options options;
-#ifdef YNN_ENABLE_PERFETTO
-  options.trace = options.trace || get_trace_filename() != nullptr;
-#endif
-#ifdef YNN_ENABLE_TSL_PROFILER
-  options.trace = options.trace || ynn_traceme_enabled();
-#endif
-#ifdef NDEBUG
-  options.no_checks = true;
-#endif
-
   pipeline = slinky::build_pipeline(globals.symbols, {}, inputs, outputs,
                                     globals.lets, options);
+
+  if (!cache_key.empty()) {
+    std::map<slinky::var, slinky::const_raw_buffer_ptr> placeholders =
+        static_buffer_bindings(values, /*placeholders=*/true);
+    if (can_cache_pipeline(pipeline.body, placeholders, globals.symbols)) {
+      slinky::pipeline cached = pipeline;
+      cached.body = replace_constant_buffers(cached.body, placeholders);
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      cache.pipelines.emplace(cache_key, std::move(cached));
+    }
+  }
 
   slinky::call_stmt::attributes attrs;
   attrs.name = "ynn_reshape_runtime";

@@ -266,6 +266,8 @@ ynn_type get_accumulator_type(ynn_reduce_operator op, ynn_type a_type) {
   }
 }
 
+}  // namespace
+
 // Makes an identity for a reduction. For most reductions, this is a simple
 // rank-zero scalar. But for min_max reductions, we need a different reduction
 // identity value for the min and the max.
@@ -300,8 +302,6 @@ slinky::raw_buffer_ptr make_reduce_identity(ynn_type type, int rank,
   convert_n(value_f32, n, type, value.base);
   return slinky::raw_buffer::make_copy(value);
 }
-
-}  // namespace
 
 void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
                    ynn_reduce_operator op, const ynn::axes_set& k_dims,
