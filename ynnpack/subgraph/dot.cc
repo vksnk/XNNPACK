@@ -970,7 +970,13 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       // that. Splitting m here produced garbage output on a branch with the
       // fused decode1 attention path.
       index_t split_m = std::min<index_t>(m, 16);
-      split_n = std::min<index_t>(split_n, 65536);
+      // The two splits are packed as split_m * 65536 + split_n below, so
+      // split_n must stay BELOW 65536: at exactly 65536 (e.g. n=262144 with 4
+      // tasks) the packed value decodes as split_m+1, split_n=0, and a step-0
+      // loop silently drops the dot. Cap at the largest block_n multiple
+      // below 65536. (The stock heuristic has the same off-by-one cap but
+      // can never reach it.)
+      split_n = std::min<index_t>(split_n, (65535 / block_n) * block_n);
       static const bool debug = getenv("YNN_SPLIT_TASKS_DEBUG") != nullptr;
       if (debug) {
         fprintf(stderr,
