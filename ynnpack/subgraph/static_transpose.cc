@@ -4,11 +4,16 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -31,10 +36,54 @@ namespace ynn {
 
 namespace {
 
+// Temporary debug instrumentation, enabled together with YNN_DOT_STATS:
+// records the output extents of every standalone-transpose wrapper call and
+// dumps an aggregated histogram at exit. The pack's transposes do not go
+// through this wrapper, so everything recorded here is a standalone
+// static_transpose op; a shape appearing with one call per execution has no
+// schedule (runs whole on the calling thread).
+struct transpose_stats_recorder {
+  std::mutex mu;
+  // key: {elem_size, e0, e1, e2, e3} -> {calls, total bytes}
+  std::map<std::array<slinky::index_t, 5>, std::pair<uint64_t, uint64_t>>
+      shapes;
+  bool enabled = std::getenv("YNN_DOT_STATS") != nullptr;
+
+  void record(const slinky::raw_buffer& output) {
+    std::array<slinky::index_t, 5> key = {
+        static_cast<slinky::index_t>(output.elem_size), 1, 1, 1, 1};
+    uint64_t bytes = output.elem_size;
+    for (std::size_t d = 0; d < output.rank && d < 4; ++d) {
+      key[d + 1] = output.dim(d).extent();
+      bytes *= output.dim(d).extent();
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    auto& entry = shapes[key];
+    entry.first++;
+    entry.second += bytes;
+  }
+
+  ~transpose_stats_recorder() {
+    if (!enabled || shapes.empty()) return;
+    for (const auto& s : shapes) {
+      const auto& k = s.first;
+      fprintf(stderr,
+              "YNN_TRANSPOSE_STATS: elem=%lld extents=%lldx%lldx%lldx%lld "
+              "calls=%llu bytes=%llu\n",
+              (long long)k[0], (long long)k[1], (long long)k[2],
+              (long long)k[3], (long long)k[4],
+              (unsigned long long)s.second.first,
+              (unsigned long long)s.second.second);
+    }
+  }
+};
+transpose_stats_recorder transpose_stats;
+
 auto make_transpose_impl(int elem_count, std::vector<int32_t> permutation) {
   return [elem_count, permutation](
              const slinky::raw_buffer& input,
              const slinky::raw_buffer& output) -> slinky::index_t {
+    if (transpose_stats.enabled) transpose_stats.record(output);
     // Make a shallow copy of the input buffers. We need to be able to slice
     // dimensions from these buffers, and reorder the input dimensions.
     slinky::buffer<void, max_tensor_rank> sliced_output = output;
