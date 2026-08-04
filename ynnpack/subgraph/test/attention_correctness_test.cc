@@ -97,7 +97,11 @@ void RunAttentionTest(const AttentionParams& p) {
   const float scale = 1.0f / std::sqrt(static_cast<float>(p.h));
   const bool sliced = p.s_active != 0;
   const size_t s_used = sliced ? p.s_active : p.s;
-  const bool dynamic = sliced;
+  // The cache/Q/O tensors have static capacity; only the slice template has
+  // runtime dims, mirroring a KV cache of fixed size whose valid length
+  // changes per step.
+  const bool dynamic = false;
+  const bool dynamic_template = sliced;
 
   TestScheduler scheduler(p.threads - 1);
   ynn_threadpool_t threadpool_raw = nullptr;
@@ -138,8 +142,9 @@ void RunAttentionTest(const AttentionParams& p) {
   uint32_t actual_o_id = o_id;
   if (sliced) {
     ASSERT_EQ(ynn_define_tensor(subgraph.get(), ynn_type_fp32, 4,
-                                dynamic ? nullptr : kv_active_dims, nullptr,
-                                YNN_VALUE_FLAG_EXTERNAL_INPUT, &dummy_kv_id),
+                                dynamic_template ? nullptr : kv_active_dims,
+                                nullptr, YNN_VALUE_FLAG_EXTERNAL_INPUT,
+                                &dummy_kv_id),
               ynn_status_success);
     int32_t seq_axis = p.transpose_io ? 1 : 2;
     uint32_t sliced_k_id = YNN_INVALID_VALUE_ID;
@@ -189,18 +194,10 @@ void RunAttentionTest(const AttentionParams& p) {
     transpose_bnth_to_btnh(p.b, p.n, p.s, p.h, v, v_ext);
   }
 
-  if (dynamic) {
-    ASSERT_EQ(ynn_set_external_value_shape(runtime.get(), q_id, 4, qo_dims),
+  if (dynamic_template) {
+    ASSERT_EQ(ynn_set_external_value_shape(runtime.get(), dummy_kv_id, 4,
+                                           kv_active_dims),
               ynn_status_success);
-    ASSERT_EQ(ynn_set_external_value_shape(runtime.get(), k_id, 4, kv_dims),
-              ynn_status_success);
-    ASSERT_EQ(ynn_set_external_value_shape(runtime.get(), v_id, 4, kv_dims),
-              ynn_status_success);
-    if (sliced) {
-      ASSERT_EQ(ynn_set_external_value_shape(runtime.get(), dummy_kv_id, 4,
-                                             kv_active_dims),
-                ynn_status_success);
-    }
   }
   ASSERT_EQ(ynn_set_external_value_data(runtime.get(), q_id, q_ext.data()),
             ynn_status_success);

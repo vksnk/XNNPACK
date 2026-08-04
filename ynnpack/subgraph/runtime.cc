@@ -48,6 +48,7 @@
 #include "slinky/runtime/depends_on.h"
 #include "slinky/runtime/evaluate.h"
 #include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
 #include "slinky/runtime/stmt.h"
 
 void ynn_runtime_value::make_buffer(ynn_runtime& runtime,
@@ -962,6 +963,13 @@ ynn_status ynn_runtime::build() {
 
   pipeline = slinky::build_pipeline(globals.symbols, {}, inputs, outputs,
                                     globals.lets, options);
+
+  // Temporary debug instrumentation: dump the built pipeline body to stderr.
+  if (std::getenv("YNN_DUMP_PIPELINE")) {
+    std::stringstream ss;
+    slinky::print(ss, pipeline.body, &globals.symbols);
+    fprintf(stderr, "YNN_PIPELINE:\n%s\n", ss.str().c_str());
+  }
 
   slinky::call_stmt::attributes attrs;
   attrs.name = "ynn_reshape_runtime";
