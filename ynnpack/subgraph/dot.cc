@@ -923,6 +923,15 @@ uint32_t define_transpose_a(ynn_subgraph& subgraph, index_t tile_k,
 // and the step-0 loop silently dropped the dot).
 constexpr index_t kSplitPackBase = index_t(1) << 32;
 
+// Experiment knob: target ~N tasks per dot loop instead of a tile size.
+index_t split_tasks_target() {
+  static const index_t value = []() -> index_t {
+    const char* env = getenv("YNN_SPLIT_TASKS");
+    return env ? atoi(env) : 0;
+  }();
+  return value;
+}
+
 index_t compute_dot_splits(index_t m, index_t n, index_t k, index_t block_n) {
   {
     assert(block_n > 0);
@@ -948,10 +957,7 @@ index_t compute_dot_splits(index_t m, index_t n, index_t k, index_t block_n) {
     // keeping n splits aligned to block_n. The tile-size heuristic below is
     // blind to the thread count, which leaves mid-sized dots (m=1,
     // n=256..2048) with only 2-8 uneven tasks.
-    static const index_t target_tasks = []() -> index_t {
-      const char* env = getenv("YNN_SPLIT_TASKS");
-      return env ? atoi(env) : 0;
-    }();
+    const index_t target_tasks = split_tasks_target();
     // Only for dots with few rows: with larger m the cache-sized tiles below
     // exist to reuse B across rows, and task-sized splits would stream the
     // whole of B per task (measured: -29% decode, +29% prefill on
@@ -1032,6 +1038,38 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
     slinky::expr split_n = slinky::expr(packed % kSplitPackBase);
     slinky::expr split_k =
         slinky::expr(*kc >= 64 ? align_up<index_t>(*kc, 64) : *kc);
+    return {split_n, split_m, split_k};
+  }
+
+  // Task-count splits (YNN_SPLIT_TASKS) do not depend on `k`, so they remain
+  // computable when only the reduction extent is symbolic (e.g. a dot
+  // against a runtime-length KV cache), and expressible as symbolic
+  // arithmetic when `n` itself is the runtime extent. The latter is what
+  // keeps loops over sliced dimensions from degenerating to a single task:
+  // the split scales with the extent, so the loop always has ~N tasks at any
+  // runtime length.
+  const index_t target_tasks = split_tasks_target();
+  if (target_tasks > 0 && mc && *mc <= 16 && bc) {
+    slinky::expr split_k =
+        kc ? slinky::expr(*kc >= 64 ? align_up<index_t>(*kc, 64) : *kc)
+           : slinky::select(k >= 64, slinky::align_up(k, 64), k);
+    slinky::expr split_m = slinky::expr(std::min<index_t>(*mc, 16));
+    slinky::expr split_n;
+    if (nc) {
+      const index_t blocks = ceil_div(*nc, *bc);
+      const index_t tasks_n = std::min<index_t>(target_tasks, blocks);
+      split_n = slinky::expr(
+          std::min<index_t>(*bc * ceil_div(blocks, tasks_n), *nc));
+    } else {
+      slinky::expr blocks = slinky::ceil_div(n, block_n);
+      slinky::expr tasks_n =
+          slinky::min(slinky::expr(target_tasks), blocks);
+      split_n = runtime.globals.get(
+          slinky::simplify(
+              slinky::min(block_n * slinky::ceil_div(blocks, tasks_n), n)),
+          "task_split_n");
+    }
+    split_k = runtime.globals.get(split_k, "split_k");
     return {split_n, split_m, split_k};
   }
 
