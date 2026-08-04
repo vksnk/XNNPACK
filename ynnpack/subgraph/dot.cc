@@ -953,6 +953,12 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       const char* env = getenv("YNN_SPLIT_TASKS");
       return env ? atoi(env) : 0;
     }();
+    // The two splits are packed into one integer as
+    // split_m * kSplitPackBase + split_n; 2^32 leaves no reachable overlap
+    // (a base of 65536 was an off-by-one landmine: split_n == 65536 decoded
+    // as split_m+1, split_n = 0, and the step-0 loop silently dropped the
+    // dot).
+    constexpr index_t kSplitPackBase = index_t(1) << 32;
     // Only for dots with few rows: with larger m the cache-sized tiles below
     // exist to reuse B across rows, and task-sized splits would stream the
     // whole of B per task (measured: -29% decode, +29% prefill on
@@ -970,13 +976,6 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       // that. Splitting m here produced garbage output on a branch with the
       // fused decode1 attention path.
       index_t split_m = std::min<index_t>(m, 16);
-      // The two splits are packed as split_m * 65536 + split_n below, so
-      // split_n must stay BELOW 65536: at exactly 65536 (e.g. n=262144 with 4
-      // tasks) the packed value decodes as split_m+1, split_n=0, and a step-0
-      // loop silently drops the dot. Cap at the largest block_n multiple
-      // below 65536. (The stock heuristic has the same off-by-one cap but
-      // can never reach it.)
-      split_n = std::min<index_t>(split_n, (65535 / block_n) * block_n);
       static const bool debug = getenv("YNN_SPLIT_TASKS_DEBUG") != nullptr;
       if (debug) {
         fprintf(stderr,
@@ -986,7 +985,7 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
                 (long long)split_m, (long long)split_n,
                 (long long)ceil_div(n, split_n));
       }
-      return split_m * 65536 + split_n;
+      return split_m * kSplitPackBase + split_n;
     }
 
     // A parameter indicating the target split_m/split_n ratio.
@@ -1018,14 +1017,14 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
 
     split_m = std::min<index_t>(split_m, 32768);
     split_n = std::min<index_t>(split_n, 65536);
-    return split_m * 65536 + split_n;
+    return split_m * kSplitPackBase + split_n;
   };
   slinky::expr splits = slinky::call::make(impl, {m, n, k, block_n});
 
   // Extract the splits from the single index_t result.
   splits = runtime.globals.get(splits, "dot_splits");
-  slinky::expr split_m = splits / 65536;
-  slinky::expr split_n = splits % 65536;
+  slinky::expr split_m = splits / (int64_t(1) << 32);
+  slinky::expr split_n = splits % (int64_t(1) << 32);
   // Align `split_k` to be a multiple of possible values of `tile_k`. We cannot
   // use the value of `tile_k` directly since this varies by CPU, so we use 64
   // as a heuristic.
