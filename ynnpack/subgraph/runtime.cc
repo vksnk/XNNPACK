@@ -944,7 +944,8 @@ ynn_status ynn_runtime::build() {
     }
   }
 
-  if ((flags & YNN_RUNTIME_FLAG_NO_SCHEDULE) == 0) {
+  if ((flags & YNN_RUNTIME_FLAG_NO_SCHEDULE) == 0 &&
+      std::getenv("YNN_NO_SCHEDULE") == nullptr) {
     schedule();
   }
 

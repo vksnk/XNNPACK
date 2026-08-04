@@ -71,6 +71,11 @@ uint64_t get_supported_arch_flags() {
       if (cpuinfo_has_x86_amx_fp16()) result |= arch_flag::amxfp16;
       if (cpuinfo_has_x86_amx_int8()) result |= arch_flag::amxint8;
     }
+    // Temporary debug override: emulate non-VNNI hardware (e.g. Skylake-SP)
+    // on machines that have VNNI, to test kernel selection and fallbacks.
+    if (getenv("YNN_NO_VNNI")) {
+      result &= ~(arch_flag::avx512vnni | arch_flag::amxint8);
+    }
 #endif  // YNN_ARCH_X86
 #ifdef YNN_ARCH_ARM
     if (cpuinfo_has_arm_neon()) result |= arch_flag::neon;

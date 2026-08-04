@@ -10,8 +10,12 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -222,6 +226,51 @@ constexpr index_t cache_size_l2 = 128 * 1024;
 // kernel tile sizes, etc.).
 constexpr index_t consistent_block_n = 64;
 
+// Temporary debug instrumentation: with YNN_DOT_STATS=1, record the actual
+// (elem_size, m, n, k1, k2, k3) of every dot kernel wrapper call and dump an
+// aggregated histogram to stderr at process exit.
+struct dot_stats_recorder {
+  std::mutex mu;
+  // key: {a_elem_size, m, n, k1, k2, k3} -> {calls, total MACs}
+  std::map<std::array<slinky::index_t, 6>, std::pair<uint64_t, uint64_t>>
+      shapes;
+  bool enabled = std::getenv("YNN_DOT_STATS") != nullptr;
+
+  void record(slinky::index_t elem, slinky::index_t m, slinky::index_t n,
+              slinky::index_t k1, slinky::index_t k2, slinky::index_t k3) {
+    uint64_t macs = static_cast<uint64_t>(m) * n * k1 * k2 * k3;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& entry = shapes[{elem, m, n, k1, k2, k3}];
+    entry.first++;
+    entry.second += macs;
+  }
+
+  ~dot_stats_recorder() {
+    if (!enabled || shapes.empty()) return;
+    std::vector<std::pair<std::array<slinky::index_t, 6>,
+                          std::pair<uint64_t, uint64_t>>>
+        sorted(shapes.begin(), shapes.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& x, const auto& y) {
+      return x.second.second > y.second.second;
+    });
+    uint64_t total = 0;
+    for (const auto& s : sorted) total += s.second.second;
+    fprintf(stderr, "YNN_DOT_STATS: total MACs %llu\n",
+            (unsigned long long)total);
+    for (size_t i = 0; i < sorted.size() && i < 40; ++i) {
+      const auto& k = sorted[i].first;
+      fprintf(stderr,
+              "YNN_DOT_STATS: elem=%lld m=%lld n=%lld k=%lldx%lldx%lld "
+              "calls=%llu macs=%llu\n",
+              (long long)k[0], (long long)k[1], (long long)k[2],
+              (long long)k[3], (long long)k[4], (long long)k[5],
+              (unsigned long long)sorted[i].second.first,
+              (unsigned long long)sorted[i].second.second);
+    }
+  }
+};
+dot_stats_recorder dot_stats;
+
 // The wrapper for the kernel we use when we actually want to run a dot kernel
 // on some buffers.
 auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool transposed_a,
@@ -330,6 +379,11 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool transposed_a,
     shape.k1 = k1;
     shape.k2 = k2;
     shape.k3 = k3;
+    if (dot_stats.enabled) {
+      dot_stats.record(static_cast<slinky::index_t>(a.elem_size),
+                       c_m.extent(), c_n.extent(), k1_extent, k2_extent,
+                       k3_extent);
+    }
     dot_packed_shape packed_shape;
     packed_shape.block_n = block_n;
     packed_shape.tile_k = tile_k;
