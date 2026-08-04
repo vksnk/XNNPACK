@@ -961,12 +961,25 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       const index_t blocks_n = ceil_div(n, block_n);
       const index_t tasks_n = std::min<index_t>(target_tasks, blocks_n);
       index_t split_n = block_n * ceil_div(blocks_n, tasks_n);
+      // Never exceed the extent: for n <= block_n the stock heuristic
+      // returns exactly n (min(n, block_n)), and a split larger than the
+      // extent is a state stock never produces.
+      split_n = std::min<index_t>(split_n, n);
       // Never split m: the stock heuristic keeps m <= 16 whole
       // (split_m = min(m, 16)), and consumers of few-row dots may rely on
       // that. Splitting m here produced garbage output on a branch with the
       // fused decode1 attention path.
       index_t split_m = std::min<index_t>(m, 16);
       split_n = std::min<index_t>(split_n, 65536);
+      static const bool debug = getenv("YNN_SPLIT_TASKS_DEBUG") != nullptr;
+      if (debug) {
+        fprintf(stderr,
+                "YNN_SPLIT: m=%lld n=%lld k=%lld block_n=%lld -> split_m=%lld "
+                "split_n=%lld tasks=%lld\n",
+                (long long)m, (long long)n, (long long)k, (long long)block_n,
+                (long long)split_m, (long long)split_n,
+                (long long)ceil_div(n, split_n));
+      }
       return split_m * 65536 + split_n;
     }
 
