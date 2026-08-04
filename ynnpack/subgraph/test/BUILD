@@ -252,6 +252,23 @@ cc_test(
 )
 
 cc_test(
+    name = "attention_correctness_test",
+    srcs = [
+        "attention_correctness_test.cc",
+        "attention_graph.cc",
+        "attention_graph.h",
+    ],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":scheduler",
+        "//ynnpack",
+        "//ynnpack/base",
+        "//ynnpack/composites",
+    ] + ynn_test_deps(),
+)
+
+cc_test(
     name = "attention_bench",
     srcs = [
         "attention_bench.cc",
