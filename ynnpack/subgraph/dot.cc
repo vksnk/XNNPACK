@@ -916,16 +916,15 @@ uint32_t define_transpose_a(ynn_subgraph& subgraph, index_t tile_k,
   return output.id;
 }
 
-std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
-    ynn_runtime& runtime, slinky::expr m, slinky::expr n, slinky::expr k,
-    slinky::expr block_n) {
-  // We can only return a scalar from a slinky expression, so we pack the
-  // splits into one integer.
-  auto impl = [](const slinky::call* op, slinky::eval_context& ctx) {
-    index_t m = evaluate(op->args[0], ctx);
-    index_t n = evaluate(op->args[1], ctx);
-    index_t k = evaluate(op->args[2], ctx);
-    index_t block_n = evaluate(op->args[3], ctx);
+// The two splits are packed into one integer as
+// split_m * kSplitPackBase + split_n, because a slinky expression can only
+// return a scalar; 2^32 leaves no reachable overlap (a base of 65536 was an
+// off-by-one landmine: split_n == 65536 decoded as split_m+1, split_n = 0,
+// and the step-0 loop silently dropped the dot).
+constexpr index_t kSplitPackBase = index_t(1) << 32;
+
+index_t compute_dot_splits(index_t m, index_t n, index_t k, index_t block_n) {
+  {
     assert(block_n > 0);
 
     // If k gets big, we're going to tile k anyways. It could be faster to
@@ -953,12 +952,6 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       const char* env = getenv("YNN_SPLIT_TASKS");
       return env ? atoi(env) : 0;
     }();
-    // The two splits are packed into one integer as
-    // split_m * kSplitPackBase + split_n; 2^32 leaves no reachable overlap
-    // (a base of 65536 was an off-by-one landmine: split_n == 65536 decoded
-    // as split_m+1, split_n = 0, and the step-0 loop silently dropped the
-    // dot).
-    constexpr index_t kSplitPackBase = index_t(1) << 32;
     // Only for dots with few rows: with larger m the cache-sized tiles below
     // exist to reuse B across rows, and task-sized splits would stream the
     // whole of B per task (measured: -29% decode, +29% prefill on
@@ -1018,13 +1011,41 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
     split_m = std::min<index_t>(split_m, 32768);
     split_n = std::min<index_t>(split_n, 65536);
     return split_m * kSplitPackBase + split_n;
+  }
+}
+
+std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
+    ynn_runtime& runtime, slinky::expr m, slinky::expr n, slinky::expr k,
+    slinky::expr block_n) {
+  // When every extent is known at build time, fold the heuristic to constant
+  // splits: an opaque `call` cannot be simplified, so without this every dot
+  // loop's step is a symbolic expression even in a fully static graph, and
+  // the scheduler cannot prove task counts (e.g. that a loop has exactly one
+  // task and needs no parallel machinery).
+  std::optional<index_t> mc = slinky::as_constant(m);
+  std::optional<index_t> nc = slinky::as_constant(n);
+  std::optional<index_t> kc = slinky::as_constant(k);
+  std::optional<index_t> bc = slinky::as_constant(block_n);
+  if (mc && nc && kc && bc) {
+    const index_t packed = compute_dot_splits(*mc, *nc, *kc, *bc);
+    slinky::expr split_m = slinky::expr(packed / kSplitPackBase);
+    slinky::expr split_n = slinky::expr(packed % kSplitPackBase);
+    slinky::expr split_k =
+        slinky::expr(*kc >= 64 ? align_up<index_t>(*kc, 64) : *kc);
+    return {split_n, split_m, split_k};
+  }
+
+  auto impl = [](const slinky::call* op, slinky::eval_context& ctx) {
+    return compute_dot_splits(
+        evaluate(op->args[0], ctx), evaluate(op->args[1], ctx),
+        evaluate(op->args[2], ctx), evaluate(op->args[3], ctx));
   };
   slinky::expr splits = slinky::call::make(impl, {m, n, k, block_n});
 
   // Extract the splits from the single index_t result.
   splits = runtime.globals.get(splits, "dot_splits");
-  slinky::expr split_m = splits / (int64_t(1) << 32);
-  slinky::expr split_n = splits % (int64_t(1) << 32);
+  slinky::expr split_m = splits / kSplitPackBase;
+  slinky::expr split_n = splits % kSplitPackBase;
   // Align `split_k` to be a multiple of possible values of `tile_k`. We cannot
   // use the value of `tile_k` directly since this varies by CPU, so we use 64
   // as a heuristic.
