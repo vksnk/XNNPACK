@@ -961,12 +961,11 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       const index_t blocks_n = ceil_div(n, block_n);
       const index_t tasks_n = std::min<index_t>(target_tasks, blocks_n);
       index_t split_n = block_n * ceil_div(blocks_n, tasks_n);
-      const index_t tasks_left =
-          ceil_div(target_tasks, ceil_div(n, split_n));
-      const index_t tasks_m = std::max<index_t>(
-          1, std::min<index_t>(tasks_left, m));
-      index_t split_m = ceil_div(m, tasks_m);
-      split_m = std::min<index_t>(split_m, 32768);
+      // Never split m: the stock heuristic keeps m <= 16 whole
+      // (split_m = min(m, 16)), and consumers of few-row dots may rely on
+      // that. Splitting m here produced garbage output on a branch with the
+      // fused decode1 attention path.
+      index_t split_m = std::min<index_t>(m, 16);
       split_n = std::min<index_t>(split_n, 65536);
       return split_m * 65536 + split_n;
     }
