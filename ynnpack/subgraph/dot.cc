@@ -944,6 +944,33 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
     // The maximum cost of a tile, according to the cost function (m + n) * k.
     const index_t max_cost = 1024 * 64;
 
+    // Experiment (YNN_SPLIT_TASKS=N): instead of growing a tile to a target
+    // size, choose splits that produce ~N tasks, as evenly as possible while
+    // keeping n splits aligned to block_n. The tile-size heuristic below is
+    // blind to the thread count, which leaves mid-sized dots (m=1,
+    // n=256..2048) with only 2-8 uneven tasks.
+    static const index_t target_tasks = []() -> index_t {
+      const char* env = getenv("YNN_SPLIT_TASKS");
+      return env ? atoi(env) : 0;
+    }();
+    // Only for dots with few rows: with larger m the cache-sized tiles below
+    // exist to reuse B across rows, and task-sized splits would stream the
+    // whole of B per task (measured: -29% decode, +29% prefill on
+    // gemma3-270m; the gate keeps the former and avoids the latter).
+    if (target_tasks > 0 && m <= 16) {
+      const index_t blocks_n = ceil_div(n, block_n);
+      const index_t tasks_n = std::min<index_t>(target_tasks, blocks_n);
+      index_t split_n = block_n * ceil_div(blocks_n, tasks_n);
+      const index_t tasks_left =
+          ceil_div(target_tasks, ceil_div(n, split_n));
+      const index_t tasks_m = std::max<index_t>(
+          1, std::min<index_t>(tasks_left, m));
+      index_t split_m = ceil_div(m, tasks_m);
+      split_m = std::min<index_t>(split_m, 32768);
+      split_n = std::min<index_t>(split_n, 65536);
+      return split_m * 65536 + split_n;
+    }
+
     // A parameter indicating the target split_m/split_n ratio.
     // TODO(b/438841352): Figure out why we want tall skinny tiles, at least on
     // AMD Rome.

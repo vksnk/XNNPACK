@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <utility>
@@ -232,6 +233,41 @@ std::vector<slinky::expr> make_split_factors(
     }
     return slinky::expr(1);
   };
+
+  // Experiment (YNN_SPLIT_TASKS=N): choose splits that produce ~N tasks
+  // instead of cache-sized tiles. Task counts are handed out to dimensions in
+  // reverse loop order (outermost first), respecting alignments; a small
+  // per-task floor keeps microscopic ops from being shredded into tasks whose
+  // dispatch costs more than their work.
+  static const int target_tasks = []() {
+    const char* env = getenv("YNN_SPLIT_TASKS_ALL");
+    return env ? atoi(env) : 0;
+  }();
+  if (target_tasks > 0) {
+    // Do not create tasks smaller than ~4KB of output.
+    slinky::expr min_split = slinky::ceil_div(slinky::expr(4096), element_cost);
+    slinky::expr tasks_left = target_tasks;
+    for (int index_d = rank - 1; index_d >= 0; --index_d) {
+      int d = get_loop_dim(index_d);
+      if (!extents[d].defined()) continue;
+      if (d < given_splits.size()) {
+        splits[d] = d < given_splits.size() ? given_splits[d] : slinky::expr();
+        continue;
+      }
+      const slinky::expr align = alignment_of(d);
+      slinky::expr blocks = slinky::ceil_div(extents[d], align);
+      slinky::expr blocks_per_task =
+          slinky::max(slinky::ceil_div(blocks, tasks_left),
+                      slinky::ceil_div(min_split, align));
+      slinky::expr s =
+          slinky::simplify(slinky::min(align * blocks_per_task, extents[d]));
+      s = globals.get(s, "s");
+      splits[d] = s;
+      tasks_left = slinky::simplify(slinky::max(
+          1, tasks_left / slinky::max(1, slinky::ceil_div(extents[d], s))));
+    }
+    return splits;
+  }
 
   // Reserve one alignment-sized block for every dimension whose split we are
   // going to compute by pre-multiplying the alignments into the used area, so
