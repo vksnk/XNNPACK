@@ -164,6 +164,29 @@ __m{bits}i b_{k}_{j+8} = {mm}_cvtepi8_epi16({mm2}_load_si{bits//2}({b8_ptr}));
 {c_ij8} = {mm}_add_epi32({c_ij8}, {mm}_madd_epi16(a_{i}_{k}, b_{k}_{j+8}));
 """
 
+  # Software-prefetch the packed B stream a fixed distance ahead of the loads.
+  # Machines whose hardware prefetchers do not keep up with a streaming B at
+  # m=1 (e.g. Skylake-SP servers, where memory latency is high) stall without
+  # this; XNNPACK ships _prfm kernel variants for the same reason. On machines
+  # with strong prefetchers (Zen 5) this is neutral: the kernel is already at
+  # the single-core bandwidth ceiling.
+  prefetch_b_bytes = 4096
+
+  def generate_block(self):
+    result = ""
+    block_n, block_k = self.block_shape[1], self.block_shape[2]
+    block_bytes = block_n * block_k
+    pf_iters = max(1, self.prefetch_b_bytes // block_bytes)
+    for j in range(0, block_n, self.b_chunk_n):
+      chunk_bytes = min(self.b_chunk_n, block_n) * block_k
+      for ofs in range(0, chunk_bytes, 64):
+        result += (
+            f"_mm_prefetch(reinterpret_cast<const char*>(offset_bytes("
+            f"B_k1_{j}, ({pf_iters} * {block_k}) * B_stride_k1 + {ofs})),"
+            " _MM_HINT_T1);\n"
+        )
+    return result + super().generate_block()
+
 
 generate_dot_kernels(
     x86_avx2_int8_int8_int32(),
