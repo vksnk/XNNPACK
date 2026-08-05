@@ -17,6 +17,7 @@ over and therefore never has to be packed.
 # pylint: disable=missing-class-docstring
 # pylint: disable=invalid-name
 
+from ynnpack.kernels.dot.generator.dot_base import dot_base
 from ynnpack.kernels.dot.generator.dot_base import generate_dot_kernels
 from ynnpack.kernels.dot.generator.x86 import x86_avx512
 
@@ -82,5 +83,151 @@ generate_dot_kernels(
         (2, 64, 4),
         (4, 64, 4),
         (5, 64, 4),
+    ],
+)
+
+
+class x86_avx512vnni_int8_uint8_int32_k64(dot_base):
+  """int8 x uint8 AVX-512 VNNI dot kernel specialized for n == 1.
+
+  The k-major counterpart of the kernels above, for the swapped dot's other
+  extreme: a single query head against the cache. Each vector holds 64 `k`
+  values of one row, `vpdpbusd` accumulates 16 independent partial sums, and
+  the horizontal reduction happens once per row at the end.
+  """
+
+  def __init__(self):
+    super().__init__("avx512vnni", "int8_uint8_int32")
+    self.a_type = "int8_t"
+    self.b_type = "uint8_t"
+    self.c_type = "int32_t"
+    self.tile_shape = (1, 1, 64)
+    self.flags += ["dot_flag::consistent_arithmetic"]
+
+  def header(self):
+    return """\
+#include <immintrin.h>
+""" + super().header()
+
+  def init_c_tile(self, i, j):
+    return f"__m512i c_{i}_{j} = _mm512_setzero_si512();\n"
+
+  def load_a_tile(self, i, k):
+    return (
+        f"__m512i a_{i}_{k} ="
+        f" _mm512_loadu_si512({self.a_ptr(i, k, '__m512i')});\n"
+    )
+
+  def load_b_tile(self, k, j):
+    return (
+        f"__m512i b_{k}_{j} ="
+        f" _mm512_loadu_si512({self.b_ptr(k, j, '__m512i')});\n"
+    )
+
+  def product(self, i, j, k):
+    # `b` is the unsigned operand here, so it goes first.
+    return (
+        f"c_{i}_{j} = _mm512_dpbusd_epi32(c_{i}_{j}, b_{k}_{j}, a_{i}_{k});\n"
+    )
+
+  def finalize_c_tile(self, i, j):
+    return f"int32_t cs_{i}_{j} = _mm512_reduce_add_epi32(c_{i}_{j});\n"
+
+  def add_c_tile(self, i, j):
+    return f"cs_{i}_{j} += *{self.c_in_ptr(i, j)};\n"
+
+  def store_c_tile(self, i, j):
+    return f"*{self.c_out_ptr(i, j)} = cs_{i}_{j};\n"
+
+  # n is always 1 (tile_shape[1] == block_shape[1] == 1), so the "tail" case
+  # (n < tile_shape[1]) never actually triggers at runtime; these just need to
+  # be valid, and reusing the main-case codegen is correct since there's only
+  # ever one possible n.
+  def add_c_tile_tail(self, i, j, n):
+    return self.add_c_tile(i, j)
+
+  def store_c_tile_tail(self, i, j, n):
+    return self.store_c_tile(i, j)
+
+
+class x86_avx512_int8_uint8_int32_k32(dot_base):
+  """int8 x uint8 AVX-512BW dot kernel specialized for n == 1.
+
+  For machines without VNNI: both operands widen to int16 (the products fit,
+  |-128 * 255| < 2^15) and `madd` produces pairwise int32 sums.
+  """
+
+  def __init__(self):
+    super().__init__("avx512", "int8_uint8_int32")
+    self.a_type = "int8_t"
+    self.b_type = "uint8_t"
+    self.c_type = "int32_t"
+    self.tile_shape = (1, 1, 32)
+    self.flags += ["dot_flag::consistent_arithmetic"]
+
+  def header(self):
+    return """\
+#include <immintrin.h>
+""" + super().header()
+
+  def init_c_tile(self, i, j):
+    return f"__m512i c_{i}_{j} = _mm512_setzero_si512();\n"
+
+  def load_a_tile(self, i, k):
+    return (
+        f"__m512i a_{i}_{k} = _mm512_cvtepi8_epi16("
+        f"_mm256_loadu_si256({self.a_ptr(i, k, '__m256i')}));\n"
+    )
+
+  def load_b_tile(self, k, j):
+    return (
+        f"__m512i b_{k}_{j} = _mm512_cvtepu8_epi16("
+        f"_mm256_loadu_si256({self.b_ptr(k, j, '__m256i')}));\n"
+    )
+
+  def product(self, i, j, k):
+    c_ij = f"c_{i}_{j}"
+    return (
+        f"{c_ij} = _mm512_add_epi32("
+        f"{c_ij}, _mm512_madd_epi16(a_{i}_{k}, b_{k}_{j}));\n"
+    )
+
+  def finalize_c_tile(self, i, j):
+    return f"int32_t cs_{i}_{j} = _mm512_reduce_add_epi32(c_{i}_{j});\n"
+
+  def add_c_tile(self, i, j):
+    return f"cs_{i}_{j} += *{self.c_in_ptr(i, j)};\n"
+
+  def store_c_tile(self, i, j):
+    return f"*{self.c_out_ptr(i, j)} = cs_{i}_{j};\n"
+
+  # n is always 1 (tile_shape[1] == block_shape[1] == 1), so the "tail" case
+  # (n < tile_shape[1]) never actually triggers at runtime; these just need to
+  # be valid, and reusing the main-case codegen is correct since there's only
+  # ever one possible n.
+  def add_c_tile_tail(self, i, j, n):
+    return self.add_c_tile(i, j)
+
+  def store_c_tile_tail(self, i, j, n):
+    return self.store_c_tile(i, j)
+
+
+generate_dot_kernels(
+    x86_avx512vnni_int8_uint8_int32_k64(),
+    [
+        (1, 1, 64),
+        (2, 1, 64),
+        (4, 1, 64),
+        (8, 1, 64),
+    ],
+)
+
+generate_dot_kernels(
+    x86_avx512_int8_uint8_int32_k32(),
+    [
+        (1, 1, 32),
+        (2, 1, 32),
+        (4, 1, 32),
+        (8, 1, 32),
     ],
 )
