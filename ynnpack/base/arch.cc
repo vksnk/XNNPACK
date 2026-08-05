@@ -7,15 +7,83 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "ynnpack/base/base.h"
+#include "ynnpack/base/log.h"
 
 #ifdef YNN_ENABLE_CPUINFO
-#include "ynnpack/base/log.h"
 #include <cpuinfo.h>
 #endif
 
 namespace ynn {
+
+namespace {
+
+// Debug knob: YNN_DISABLE_ARCH is a comma-separated list of arch flag names
+// (e.g. "avx512vnni,amxint8") to remove from the detected features.
+uint64_t get_disabled_arch_flags() {
+  const char* disabled = getenv("YNN_DISABLE_ARCH");
+  if (!disabled) return 0;
+  struct named_flag {
+    const char* name;
+    uint64_t flags;
+  };
+  static constexpr named_flag named_flags[] = {
+#ifdef YNN_ARCH_X86
+      {"sse2", arch_flag::sse2},
+      {"ssse3", arch_flag::ssse3},
+      {"sse41", arch_flag::sse41},
+      {"avx", arch_flag::avx},
+      {"f16c", arch_flag::f16c},
+      {"avx2", arch_flag::avx2},
+      {"fma3", arch_flag::fma3},
+      {"avx512f", arch_flag::avx512f},
+      {"avx512bw", arch_flag::avx512bw},
+      {"avx512vl", arch_flag::avx512vl},
+      {"avx512dq", arch_flag::avx512dq},
+      {"avx512bf16", arch_flag::avx512bf16},
+      {"avx512fp16", arch_flag::avx512fp16},
+      {"avx512vnni", arch_flag::avx512vnni},
+      {"avx512", arch_flag::avx512},
+      {"amxbf16", arch_flag::amxbf16},
+      {"amxfp16", arch_flag::amxfp16},
+      {"amxint8", arch_flag::amxint8},
+#endif  // YNN_ARCH_X86
+#ifdef YNN_ARCH_ARM
+      {"neon", arch_flag::neon},
+      {"neonfma", arch_flag::neonfma},
+      {"neondot", arch_flag::neondot},
+      {"neonfp16", arch_flag::neonfp16},
+      {"neonfp16arith", arch_flag::neonfp16arith},
+      {"neonbf16", arch_flag::neonbf16},
+      {"neonfp8", arch_flag::neonfp8},
+      {"neonfp8dot4", arch_flag::neonfp8dot4},
+      {"neoni8mm", arch_flag::neoni8mm},
+      {"sme", arch_flag::sme},
+      {"sme2", arch_flag::sme2},
+      {"sve", arch_flag::sve},
+#endif  // YNN_ARCH_ARM
+  };
+  uint64_t result = 0;
+  const char* token = disabled;
+  while (*token) {
+    const char* end = strchr(token, ',');
+    const size_t len = end ? static_cast<size_t>(end - token) : strlen(token);
+    for (const named_flag& f : named_flags) {
+      if (strlen(f.name) == len && strncmp(f.name, token, len) == 0) {
+        result |= f.flags;
+      }
+    }
+    token = end ? end + 1 : token + len;
+  }
+  YNN_LOG_WARNING() << "YNN_DISABLE_ARCH is set, disabling arch flags "
+                    << result;
+  return result;
+}
+
+}  // namespace
 
 #if defined(YNN_ARCH_X86_64) && defined(__linux__) && !defined(CHROMIUM)
 #include <sys/syscall.h>
@@ -96,6 +164,7 @@ uint64_t get_supported_arch_flags() {
 #ifdef YNN_ARCH_WASM
     result |= arch_flag::simd128;
 #endif  // YNN_ARCH_WASM
+    result &= ~get_disabled_arch_flags();
     return result;
   }();
   return flags;
