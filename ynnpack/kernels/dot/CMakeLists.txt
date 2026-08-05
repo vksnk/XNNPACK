@@ -154,6 +154,7 @@ YNN_ADD_DOT_KERNELS(x86_int8_int8_int32_k16
 
 YNN_ADD_DOT_KERNELS(x86_uint8_int8_int32
   x86_avx512vnni x86_avx512vnni_uint8_int8_int32
+  x86_avx512 x86_avx512_uint8_int8_int32
 )
 
 YNN_ADD_DOT_KERNELS(x86_uint8_int8_int32_k16

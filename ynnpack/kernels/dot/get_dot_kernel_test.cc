@@ -47,6 +47,8 @@ constexpr uint64_t arch_flags_fma3 = arch_flag::fma3 | arch_flags_avx;
 constexpr uint64_t arch_flags_avx2_fma3 = arch_flags_avx2 | arch_flags_fma3;
 constexpr uint64_t arch_flags_avx512 =
     arch_flag::avx512 | arch_flags_fma3 | arch_flags_avx2;
+constexpr uint64_t arch_flags_avx512vnni =
+    arch_flag::avx512vnni | arch_flags_avx512;
 
 TEST(get_dot_kernel, small_m) {
   dot_type fp32 = {ynn_type_fp32, ynn_type_fp32, ynn_type_fp32};
@@ -153,6 +155,30 @@ TEST(get_dot_kernel, large) {
   ASSERT_EQ(fp32_large(arch_flags_avx), "dot_fp32_4x16x1_1x8x1_avx");
   ASSERT_EQ(fp32_large(arch_flags_fma3), "dot_fp32_6x16x1_1x8x1_fma3");
   ASSERT_EQ(fp32_large(arch_flags_avx512), "dot_fp32_5x64x1_1x16x1_avx512");
+}
+
+TEST(get_dot_kernel, uint8_int8) {
+  dot_type uint8 = {ynn_type_uint8, ynn_type_int8, ynn_type_int32};
+
+  auto uint8_1x = [=](uint64_t arch_flags) {
+    return get_dot_kernel_name(uint8, {1, large_shape, large_shape},
+                               arch_flags);
+  };
+  auto uint8_large = [=](uint64_t arch_flags) {
+    return get_dot_kernel_name(uint8, {large_shape, large_shape, large_shape},
+                               arch_flags);
+  };
+
+  ASSERT_EQ(uint8_1x(arch_flags_avx512),
+            "dot_uint8_int8_int32_1x64x4_1x16x4_avx512");
+  ASSERT_EQ(uint8_large(arch_flags_avx512),
+            "dot_uint8_int8_int32_5x64x4_1x16x4_avx512");
+  // With VNNI available, equal-cost kernels should resolve to the VNNI
+  // versions, which are registered first.
+  ASSERT_EQ(uint8_1x(arch_flags_avx512vnni),
+            "dot_uint8_int8_int32_1x64x4_1x16x4_avx512vnni");
+  ASSERT_EQ(uint8_large(arch_flags_avx512vnni),
+            "dot_uint8_int8_int32_5x64x4_1x16x4_avx512vnni");
 }
 
 TEST(get_dot_kernel, small_n_tile_k_1) {

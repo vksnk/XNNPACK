@@ -13,8 +13,8 @@ from ynnpack.kernels.dot.generator.x86 import x86_avx512
 
 
 class x86_avx512vnni_uint8_int8_int32(x86_avx512):
-  def __init__(self, vector_bits=512):
-    super().__init__("avx512vnni", "uint8_int8_int32", "int32_t", vector_bits, (1, 16, 4))
+  def __init__(self, arch="avx512vnni", vector_bits=512):
+    super().__init__(arch, "uint8_int8_int32", "int32_t", vector_bits, (1, 16, 4))
     self.a_type = "uint8_t"
     self.b_type = "int8_t"
     self.flags += ["dot_flag::consistent_arithmetic"]
@@ -49,8 +49,48 @@ YNN_INTRINSIC int32_t unaligned_load_u8x4(const uint8_t* ptr) {
     return f"{c_ij} = {mm}_dpbusd_epi32({c_ij}, a_{i}_{k}, b_{k}_{j});\n"
 
 
+class x86_avx512_uint8_int8_int32(x86_avx512vnni_uint8_int8_int32):
+  """Version of the kernels above for AVX512 machines without VNNI.
+
+  These use maddubs_epi16, which saturates the pairwise sums to int16, so
+  unlike the VNNI kernels, these do not have consistent arithmetic.
+  """
+
+  def __init__(self, vector_bits=512):
+    super().__init__("avx512", vector_bits)
+    self.flags.remove("dot_flag::consistent_arithmetic")
+
+  def product(self, i, j, k):
+    mm = self._mm()
+    c_ij = f"c_{i}_{j}"
+    return (
+        f"{c_ij} = {mm}_add_epi32({c_ij}, {mm}_madd_epi16("
+        f"{mm}_maddubs_epi16(a_{i}_{k}, b_{k}_{j}), {mm}_set1_epi16(1)));\n"
+    )
+
+
 generate_dot_kernels(
     x86_avx512vnni_uint8_int8_int32(),
+    [
+        (1, 64, 4),
+        (2, 64, 4),
+        (3, 64, 4),
+        (4, 64, 4),
+        (5, 64, 4),
+        (1, 32, 4),
+        (2, 32, 4),
+        (3, 32, 4),
+        (4, 32, 4),
+        (5, 32, 4),
+        (6, 32, 4),
+        (8, 32, 4),
+        (10, 32, 4),
+        (16, 16, 4),
+    ],
+)
+
+generate_dot_kernels(
+    x86_avx512_uint8_int8_int32(),
     [
         (1, 64, 4),
         (2, 64, 4),
