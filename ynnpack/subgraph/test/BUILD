@@ -383,6 +383,22 @@ cc_test(
 )
 
 cc_test(
+    name = "softmax_bench",
+    srcs = ["softmax_bench.cc"],
+    args = ["--benchmark_min_time=1x"],
+    linkopts = ynn_binary_linkopts(),
+    malloc = ynn_binary_malloc(),
+    deps = [
+        ":scheduler",
+        ":subgraph_builder",
+        "//ynnpack",
+        "//ynnpack/base",
+        "//ynnpack/base/test:tensor",
+        "//ynnpack/base/test:util",
+    ] + ynn_benchmark_deps(),
+)
+
+cc_test(
     name = "reduce_bench",
     srcs = ["reduce_bench.cc"],
     args = ["--benchmark_min_time=1x"],
