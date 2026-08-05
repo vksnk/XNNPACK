@@ -2297,13 +2297,22 @@ bool rewrite_dot_of_transpose(ynn_subgraph& subgraph, ynn_node& node,
       std::get_if<ynn_node::static_transpose>(&transpose_node.op);
   if (transpose == nullptr) return false;
 
-  if (node.inputs.size() > 2 && node.inputs[2] != YNN_INVALID_VALUE_ID) {
-    return false;
-  }
+  // A dot with an accumulator input can still be swapped: the accumulator is
+  // added to the output, which the rewrite transposes, so it just has to be
+  // transposed the same way. This is how a dot whose `a` was promoted to
+  // uint8 carries its zero point correction (see `try_requantize_rewrite`),
+  // and that correction has extent 1 in the dimension of `a`'s rows, so its
+  // transpose is only a change of metadata.
+  const uint32_t input_c_id =
+      node.inputs.size() > 2 ? node.inputs[2] : YNN_INVALID_VALUE_ID;
   const uint32_t b_id = transpose_node.inputs[0];
   const ynn_value& a = subgraph.value(a_id);
   const ynn_value& b = subgraph.value(b_id);
   if (a.rank() < 2 || a.rank() != b.rank()) return false;
+  if (input_c_id != YNN_INVALID_VALUE_ID &&
+      subgraph.value(input_c_id).rank() != a.rank()) {
+    return false;
+  }
 
   // Only a swap of the reduction dimension with the one next to it, which is
   // the last two dimensions of the tensor as the caller sees it.
@@ -2367,9 +2376,18 @@ bool rewrite_dot_of_transpose(ynn_subgraph& subgraph, ynn_node& node,
   define_static_transpose(subgraph, transpose_node, swap_k, a_id,
                           &a_transposed_id, transposes_are_free);
 
+  // The accumulator input moves with the output: transpose it the same way.
+  uint32_t input_c_transposed_id = YNN_INVALID_VALUE_ID;
+  if (input_c_id != YNN_INVALID_VALUE_ID) {
+    ynn_node c_transpose;
+    define_static_transpose(subgraph, c_transpose, swap_k, input_c_id,
+                            &input_c_transposed_id, transposes_are_free);
+    subgraph.add_node(std::move(c_transpose));
+  }
+
   uint32_t dot_id = YNN_INVALID_VALUE_ID;
   ynn_define_dot(&subgraph, /*num_k_dims=*/1, b_id, a_transposed_id,
-                 /*input_c_id=*/YNN_INVALID_VALUE_ID, &dot_id, /*flags=*/0);
+                 input_c_transposed_id, &dot_id, /*flags=*/0);
 
   uint32_t output_id = node.outputs[0];
   node.invalidate();
