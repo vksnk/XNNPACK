@@ -181,6 +181,8 @@ bool parse(const char* str, bool) {
 ynn::multi_type parse(const char* str, ynn::multi_type) {
   if (!strcmp(str, "int8_int2")) return ynn::multi_type::int8_int2_int32;
   if (!strcmp(str, "int8_int4")) return ynn::multi_type::int8_int4_int32;
+  if (!strcmp(str, "int8_uint8")) return ynn::multi_type::int8_uint8_int32;
+  if (!strcmp(str, "uint8_int8")) return ynn::multi_type::uint8_int8_int32;
   if (!strcmp(str, "int8")) return ynn::multi_type::int8_int8_int32;
   if (!strcmp(str, "fp8_e4m3")) return ynn::multi_type::fp8_e4m3_fp8_e4m3_fp32;
   if (!strcmp(str, "fp8_e5m2")) return ynn::multi_type::fp8_e5m2_fp8_e5m2_fp32;
