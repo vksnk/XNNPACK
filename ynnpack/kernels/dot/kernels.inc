@@ -50,6 +50,7 @@ YNN_DOT_KERNEL(arch_flag::amxint8, dot_uint8_int8_int32_32x32x64_16x16x4_amxint8
 #include "ynnpack/kernels/dot/x86_avx512_int8_int8_int32.inc"
 #include "ynnpack/kernels/dot/x86_avx512_int8_int8_int32_k1.inc"
 #include "ynnpack/kernels/dot/x86_avx512_int8_int8_int32_k16.inc"
+#include "ynnpack/kernels/dot/x86_avx512_int8_int8_int32_k32.inc"
 #include "ynnpack/kernels/dot/x86_avx512_uint8_int2_int32.inc"
 #include "ynnpack/kernels/dot/x86_avx512_uint8_int4_int32.inc"
 #endif  // YNN_ARCH_X86_AVX512
