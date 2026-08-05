@@ -8,6 +8,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <type_traits>
 
@@ -340,10 +342,20 @@ struct optimizer {
       return;
     }
     constexpr int b_elem_count = type_info<B>::element_count();
-    const float dot_cost_k =
+    float dot_cost_k =
         estimate_dot_cost(m, n, k, block_m, block_n, block_k, tile_m, tile_n,
                           tile_k, b_elem_count) *
         dot_arch_cost_factor(arch);
+    // Debug knob for experiments: prefer kernels whose name contains the
+    // given substring wherever they are legal (type, arch, and packing
+    // constraints still apply). A preference rather than a filter, so dots
+    // with no matching kernel keep their normal selection. Gated to small n
+    // so forcing a GEMV-style kernel for attention does not also hijack the
+    // model's wide weight dots.
+    static const char* force_kernel = getenv("YNN_DOT_FORCE");
+    if (force_kernel && n <= 16 && strstr(name, force_kernel)) {
+      dot_cost_k *= 1e-6f;
+    }
     if (!required_tile_k && !required_block_n) {
       char selected = dot_cost_k < result.cost ? '*' : ' ';
       YNN_LOG_DEBUG() << " " << selected << name << " cost=" << dot_cost_k;
