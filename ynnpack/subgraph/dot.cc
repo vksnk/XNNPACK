@@ -327,7 +327,12 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool transposed_a,
     dot_shape shape;
     shape.m = c_m.extent();
     shape.n = c_n.extent();
-    shape.k1 = k1;
+    // Use the full reduction extent (not just the part that is a multiple of
+    // tile_k): the cost model counts k blocks with ceil_div, so this counts
+    // the k tail as one more block. With a rounded-down extent, a reduction
+    // smaller than tile_k would report k1 == 0, making every candidate's
+    // estimated cost zero and the choice fall to registration order.
+    shape.k1 = k1_extent;
     shape.k2 = k2;
     shape.k3 = k3;
     dot_packed_shape packed_shape;

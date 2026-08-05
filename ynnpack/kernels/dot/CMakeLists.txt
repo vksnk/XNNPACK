@@ -115,6 +115,10 @@ YNN_ADD_DOT_KERNELS(x86_fp32_k4
   x86_avx512 x86_avx512_fp32_k4
 )
 
+YNN_ADD_DOT_KERNELS(x86_fp32_k16
+  x86_avx512 x86_avx512_fp32_k16
+)
+
 YNN_ADD_DOT_KERNELS(x86_fp64
   x86_avx x86_avx_fp64
   x86_fma3 x86_fma3_fp64
