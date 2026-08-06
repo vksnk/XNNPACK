@@ -917,6 +917,23 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
       }
     }
 
+    // The growth loop only produces power-of-two multiples of the initial
+    // splits, so a split that settles just below the extent leaves a sliver
+    // remainder tile (e.g. n = 576 settling at split_n = 512 makes tiles of
+    // 512 and 64). Keep the tile count implied by the settled split, but
+    // divide the extent evenly across those tiles, rounded up to the same
+    // granularity (576 -> 320 + 256): tiles never grow, so the cache
+    // considerations above still hold, and the largest tile shrinks.
+    auto even_split = [](index_t extent, index_t split, index_t align) {
+      if (split >= extent) return split;
+      const index_t blocks = slinky::ceil_div(extent, align);
+      const index_t tiles =
+          slinky::ceil_div(blocks, std::max<index_t>(split / align, 1));
+      return std::min(align * slinky::ceil_div(blocks, tiles), extent);
+    };
+    split_n = even_split(n, split_n, block_n);
+    split_m = even_split(m, split_m, std::min<index_t>(m, 16));
+
     split_m = std::min<index_t>(split_m, 32768);
     split_n = std::min<index_t>(split_n, 65536);
     return split_m * 65536 + split_n;

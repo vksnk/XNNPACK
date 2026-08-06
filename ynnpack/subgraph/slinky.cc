@@ -258,11 +258,40 @@ std::vector<slinky::expr> make_split_factors(
       // tile_area_so_far includes this dimension's own reservation, so the
       // quotient is the number of whole alignment-sized blocks of the area
       // available to this dimension.
-      slinky::expr blocks = tile_area / tile_area_so_far;
-      // Use as many whole blocks as possible, but never less than one.
-      slinky::expr s = slinky::simplify(
-          slinky::max(align, slinky::min(align * blocks, extents[d])));
-      s = globals.get(s, "s");
+      slinky::expr blocks =
+          slinky::simplify(tile_area / tile_area_so_far);
+      slinky::expr s;
+      std::optional<slinky::index_t> extent_c =
+          as_constant(slinky::simplify(extents[d]));
+      std::optional<slinky::index_t> align_c = as_constant(align);
+      std::optional<slinky::index_t> blocks_c = as_constant(blocks);
+      if (extent_c && align_c && blocks_c) {
+        // Divide the extent evenly across the tile count the available area
+        // implies, instead of clamping the split to the area: a clamp turns
+        // an extent just above the area into one full-sized tile plus a
+        // sliver (e.g. 576 with area for 512 -> tiles of 512 and 64), while
+        // the even division makes tiles of the same count that never exceed
+        // the area (576 -> 288 + 288, or 320 + 256 with an alignment of 64).
+        // The split stays a multiple of the alignment and never less than it.
+        // Static shapes only: written symbolically the formula nests three
+        // divisions, and the simplifier's interval analysis expands nested
+        // divisions combinatorially (effectively hanging pipeline builds for
+        // high-rank dynamic shapes).
+        const slinky::index_t a = std::max<slinky::index_t>(*align_c, 1);
+        const slinky::index_t extent_blocks = slinky::ceil_div(*extent_c, a);
+        const slinky::index_t tiles = std::max<slinky::index_t>(
+            slinky::ceil_div(extent_blocks,
+                             std::max<slinky::index_t>(*blocks_c, 1)),
+            1);
+        s = slinky::expr(
+            std::max(a, std::min(a * slinky::ceil_div(extent_blocks, tiles),
+                                 *extent_c)));
+      } else {
+        // Use as many whole blocks as possible, but never less than one.
+        s = slinky::simplify(
+            slinky::max(align, slinky::min(align * blocks, extents[d])));
+        s = globals.get(s, "s");
+      }
       splits[d] = s;
       // The reservation is already a factor of tile_area_so_far, so multiply
       // by the number of blocks the split uses rather than by the split
