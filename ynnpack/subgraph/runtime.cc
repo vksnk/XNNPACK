@@ -394,13 +394,46 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
     assert(l.parent < static_cast<int>(i));
     slinky::expr tasks_above = l.parent >= 0 ? tasks[l.parent] : 1;
     const slinky::index_t tasks_above_lb = l.parent >= 0 ? tasks_lb[l.parent] : 1;
-    // A step that is required (because of an alignment constraint) must not
-    // be changed, and reduction steps control accumulation blocking, not
-    // just task granularity, so both are left alone.
+    // A loop whose step provably covers its extent runs exactly one
+    // iteration, so it is identical for any number of functions inside it:
+    // the single call covers the same crop either way. Required steps are
+    // excluded: a callback with a required step may produce (and allocate
+    // for) a whole step-aligned tile, so the step cannot be narrowed to the
+    // extent even for a single iteration. The proof needs the global lets
+    // resolved -- split factors are frequently `min(...)` expressions that
+    // the simplifier already reduced to the extent itself, but hidden
+    // behind a let variable slinky can't see through when it builds the
+    // loop. Replacing the step with the extent expression lets slinky
+    // prove the single iteration and fold the loop away entirely.
     const bool elide_allowed =
         !l.step_is_required && globals.is_pure_dim(l.loop_id.var);
-    if (max_threads == 1 || globals.is_reduction_dim(l.loop_id.var)) {
+    // Serial reduction ("k") dims additionally qualify for the
+    // single-iteration elision below (but not for the widening elisions):
+    // with provably one iteration there is no accumulation blocking to
+    // preserve.
+    const bool single_iteration_elide_allowed =
+        elide_allowed ||
+        (!l.step_is_required && globals.is_reduction_dim(l.loop_id.var));
+    const slinky::expr simplified_extent =
+        single_iteration_elide_allowed ? slinky::simplify(l.extent)
+                                       : slinky::expr();
+    if (single_iteration_elide_allowed &&
+        slinky::prove_true(
+            simplified_extent <=
+            slinky::simplify(resolve_let_var(globals, l.step)))) {
+      // Use the simplified raw extent as the step: the loop's bounds are
+      // let-free expressions from bounds inference, and slinky does not
+      // reason through the global lets, so a let-variable step would defeat
+      // the single-iteration proof that folds the loop.
+      l.step = simplified_extent;
       l.workers = slinky::loop::serial;
+      tasks[i] = tasks_above;
+      tasks_lb[i] = tasks_above_lb;
+    } else if (max_threads == 1 || globals.is_reduction_dim(l.loop_id.var)) {
+      l.workers = slinky::loop::serial;
+      // Reduction loops are left alone even when they contain a single
+      // function: their step controls accumulation blocking, not just task
+      // granularity.
       if (elide_allowed && i < funcs_in_level.size() &&
           funcs_in_level[i] <= 1) {
         l.step = l.extent;
