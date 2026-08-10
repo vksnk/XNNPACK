@@ -323,36 +323,90 @@ std::map<std::pair<slinky::var, int>, int> infer_source_regions(
   return source_regions;
 }
 
+// If `e` is a global let variable, return the let's value (an existing,
+// shared expression -- nothing is constructed); otherwise return `e`
+// unchanged. One level is enough for the analyses below: loop steps are let
+// variables whose immediate values expose the min/max caps the constant
+// bounds need (variables remaining inside them are simply unknowns to the
+// bounds evaluator), and loop extents are stored in raw form. This
+// deliberately avoids substituting lets into expressions: full expansion
+// can grow combinatorially when let values nest.
+slinky::expr resolve_let_var(const ynn::slinky_globals& globals,
+                             const slinky::expr& e) {
+  if (auto v = slinky::as_variable(e)) {
+    for (const auto& let : globals.lets) {
+      if (let.first == *v) return let.second;
+    }
+  }
+  return e;
+}
+
 // Decide how many workers each loop of the global nest should use. This must
 // run after the whole nest is built (and all the steps are final): after
 // fusion, a function's loops can end up inside loops of other functions, so
 // the number of tasks produced outside each loop is only known once the nest
 // is complete.
+//
+// A loop whose ancestors provably always produce enough tasks can never run
+// more than one worker, so its `select(w > 1, parallel, serial)` is folded
+// to `serial`.
 void compute_workers(ynn::slinky_globals& globals, int max_threads,
                      std::vector<loop_level>& global_loop_nest) {
   // Enough tasks to have good load balancing.
   const slinky::index_t target_task_count =
       max_threads > 1 ? max_threads * 2 : 1;
 
+  // A guaranteed lower bound of the number of iterations of loop level `l`:
+  // ceil_div(lower bound of extent, upper bound of step), or 1 when either
+  // bound is unknown (a scheduled loop runs at least one iteration). The
+  // bounds are computed per factor instead of on the whole task-count
+  // expression: slinky's constant bounds bail on ceil_div's non-constant
+  // numerator, and on the correlated occurrences in expressions like
+  // (step + extent - 1) / step.
+  auto min_iterations = [&](const loop_level& l) -> slinky::index_t {
+    std::optional<slinky::index_t> extent_lb =
+        slinky::evaluate_constant_lower_bound(l.extent);
+    std::optional<slinky::index_t> step_ub =
+        slinky::evaluate_constant_upper_bound(
+            resolve_let_var(globals, l.step));
+    if (extent_lb && step_ub && *step_ub > 0) {
+      return std::max<slinky::index_t>(
+          slinky::ceil_div(*extent_lb, *step_ub), 1);
+    }
+    return 1;
+  };
+
   // The number of tasks the loops from the root down to (and including) each
   // loop can produce. Serial loops (reductions) run their iterations within
-  // one task, so they don't contribute to this count.
+  // one task, so they don't contribute to this count. `tasks_lb` is a
+  // guaranteed constant lower bound of the same quantity.
   std::vector<slinky::expr> tasks(global_loop_nest.size());
+  std::vector<slinky::index_t> tasks_lb(global_loop_nest.size());
   for (size_t i = 0; i < global_loop_nest.size(); ++i) {
     loop_level& l = global_loop_nest[i];
     assert(l.parent < static_cast<int>(i));
     slinky::expr tasks_above = l.parent >= 0 ? tasks[l.parent] : 1;
+    const slinky::index_t tasks_above_lb = l.parent >= 0 ? tasks_lb[l.parent] : 1;
     if (max_threads == 1 || globals.is_reduction_dim(l.loop_id.var)) {
       l.workers = slinky::loop::serial;
       tasks[i] = tasks_above;
+      tasks_lb[i] = tasks_above_lb;
     } else {
-      slinky::expr w =
-          slinky::ceil_div(slinky::expr(target_task_count), tasks_above);
-      w = globals.get(w, "w");
-      l.workers = slinky::simplify(slinky::select::make(
-          w > 1, slinky::loop::parallel, slinky::loop::serial));
+      // The loop is provably serial iff the loops above it always produce
+      // enough tasks: w = ceil_div(target, tasks_above) <= 1 iff
+      // tasks_above >= target.
+      if (tasks_above_lb >= target_task_count) {
+        l.workers = slinky::loop::serial;
+      } else {
+        slinky::expr w = globals.get(
+            slinky::ceil_div(slinky::expr(target_task_count), tasks_above),
+            "w");
+        l.workers = slinky::simplify(slinky::select::make(
+            w > 1, slinky::loop::parallel, slinky::loop::serial));
+      }
       tasks[i] =
           slinky::simplify(tasks_above * slinky::ceil_div(l.extent, l.step));
+      tasks_lb[i] = tasks_above_lb * min_iterations(l);
     }
   }
 }
