@@ -17,6 +17,7 @@
 #include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
+#include "ynnpack/base/type.h"
 #include "ynnpack/composites/composites.h"
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/subgraph/test/scheduler.h"
@@ -248,7 +249,7 @@ void bench_dot_sum(benchmark::State& state, ynn_threadpool_t threadpool, int m,
       benchmark::Counter(state.iterations() * ops, benchmark::Counter::kIsRate);
 }
 
-template <size_t BlockSize>
+template <size_t BlockSize, ynn_type BType = ynn_type_int8>
 void bench_blockwise(benchmark::State& state, ynn_threadpool_t threadpool,
                      int m, int n, int k) {
   if (std::abs(k) % BlockSize != 0) {
@@ -275,16 +276,19 @@ void bench_blockwise(benchmark::State& state, ynn_threadpool_t threadpool,
       subgraph.get(), ynn_type_fp32, 2, &output_shape[0], nullptr,
       /*flags=*/YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id));
 
-  // B and its blockwise scales are static.
-  std::vector<int8_t> b_data(static_cast<size_t>(std::abs(k)) * std::abs(n));
+  // B and its blockwise scales are static. Sub-byte types store multiple
+  // elements per byte along the innermost (n) dimension; fill the packed
+  // bytes directly.
+  const size_t b_elements = static_cast<size_t>(std::abs(k)) * std::abs(n);
+  std::vector<uint8_t> b_data(b_elements / ynn::type_element_count(BType));
   for (size_t i = 0; i < b_data.size(); ++i) {
-    b_data[i] = static_cast<int8_t>(i % 15) - 7;
+    b_data[i] = static_cast<uint8_t>((i * 0x9E5F) >> 3);
   }
   const size_t b_dims[2] = {static_cast<size_t>(std::abs(k)),
                             static_cast<size_t>(std::abs(n))};
   uint32_t b_id = YNN_INVALID_VALUE_ID;
-  BENCH_ASSERT_SUCCESS(ynn_define_tensor(subgraph.get(), ynn_type_int8, 2,
-                                         &b_dims[0], b_data.data(),
+  BENCH_ASSERT_SUCCESS(ynn_define_tensor(subgraph.get(), BType, 2, &b_dims[0],
+                                         b_data.data(),
                                          YNN_VALUE_FLAG_COPY_DATA, &b_id));
 
   auto b_scale_data = ones(std::abs(n) * num_blocks);
@@ -485,6 +489,8 @@ int main(int argc, char** argv) {
   register_bench("blockwise_int8_bs32", ynn::bench_blockwise<32>);
   register_bench("blockwise_int8_bs256", ynn::bench_blockwise<256>);
   register_bench("blockwise_int8_bs4096", ynn::bench_blockwise<4096>);
+  register_bench("blockwise_int4_bs32",
+                 ynn::bench_blockwise<32, ynn_type_int4>);
 
   benchmark::RunSpecifiedBenchmarks();
   return 0;
