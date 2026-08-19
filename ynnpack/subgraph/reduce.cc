@@ -514,9 +514,53 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       attrs.allow_in_place = (1 << 1);
     }
 
-    auto sched =
-        runtime.make_schedule(all_dims, input_a.physical_extents(),
-                              input_a.buffer->elem_size(), split_factors);
+    // NOTE: when no split_factors were given, this computes splits without
+    // the reservation floors from compute_reduce_alignments, so a reduction
+    // dimension that is not innermost can end up with a step of 1. Applying
+    // the floors here was tried and measured 4x slower on the fused blockwise
+    // dot: with producers fused into the reduction loop, a step of 1 streams
+    // one block at a time through a cache-sized live set, while the floored
+    // step materializes the whole reduction extent of the intermediate.
+    // Choosing the reduction step from the fused working set is step
+    // reconciliation's job.
+    std::vector<slinky::expr> phys_extents = input_a.physical_extents();
+    std::unique_ptr<ynn::scheduling_info> sched;
+    if (split_factors.empty()) {
+      std::vector<slinky::expr> splits = make_split_factors(
+          runtime.globals, phys_extents, input_a.buffer->elem_size());
+      // Group reduction steps in pairs: each iteration of a reduction loop
+      // re-reads and re-writes the whole accumulator tile, which has usually
+      // been evicted by the other output tiles visited in between, so halving
+      // the number of reduction steps is worth exceeding the tile area budget
+      // by 2x. Measured on the fused blockwise dot (m=256/n=4096/k=4096
+      // bs=32, 9900X): steps of 2 are +16% at 1 thread (fewer accumulator
+      // sweeps) and +49% at 8 threads (a serial reduction loop with parallel
+      // loops inside joins the pool once per step; grouping halves the
+      // barriers). Steps of 4 measured the same, 8+ regress once the grouped
+      // tiles outgrow L2.
+      // Only splits that are provably 1 are raised: wrapping an already
+      // whole-extent symbolic split in max() changed the step into an
+      // expression the loop rewriter couldn't reason about and produced
+      // overlapping reduction crops (double-counted elements). A provably-1
+      // split is also the only case the grouping can help. Packed sub-byte
+      // dimension 0 is left alone: its step granularity is a storage byte.
+      const int elem_count = type_element_count(input_a.type);
+      for (int i = 0; i < input_a.rank(); ++i) {
+        if (!op.k_dims[i]) continue;
+        if (i == 0 && elem_count != 1) continue;
+        if (!phys_extents[i].defined() || !splits[i].defined()) continue;
+        if (!slinky::is_constant(splits[i], 1)) continue;
+        // min(2, max(extent, 1)) never exceeds the extent and stays at least
+        // 1 for empty runtime extents (a step of 0 would never terminate).
+        splits[i] = slinky::simplify(
+            slinky::min(2, slinky::max(phys_extents[i], 1)));
+      }
+      sched = runtime.make_schedule(all_dims, phys_extents, splits,
+                                    /*loop_order=*/{});
+    } else {
+      sched = runtime.make_schedule(all_dims, phys_extents,
+                                    input_a.buffer->elem_size(), split_factors);
+    }
 
     auto func = slinky::func::make(
         make_unary_reduce_impl(op, kernel),
