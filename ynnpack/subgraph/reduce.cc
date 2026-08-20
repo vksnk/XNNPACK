@@ -28,6 +28,7 @@
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/utils.h"
 #include "slinky/base/arithmetic.h"
+#include "slinky/base/thread_pool.h"
 #include "slinky/builder/pipeline.h"
 #include "slinky/builder/simplify.h"
 #include "slinky/runtime/buffer.h"
@@ -528,32 +529,41 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
     if (split_factors.empty()) {
       std::vector<slinky::expr> splits = make_split_factors(
           runtime.globals, phys_extents, input_a.buffer->elem_size());
-      // Group reduction steps in pairs: each iteration of a reduction loop
-      // re-reads and re-writes the whole accumulator tile, which has usually
-      // been evicted by the other output tiles visited in between, so halving
-      // the number of reduction steps is worth exceeding the tile area budget
-      // by 2x. Measured on the fused blockwise dot (m=256/n=4096/k=4096
-      // bs=32, 9900X): steps of 2 are +16% at 1 thread (fewer accumulator
-      // sweeps) and +49% at 8 threads (a serial reduction loop with parallel
-      // loops inside joins the pool once per step; grouping halves the
-      // barriers). Steps of 4 measured the same, 8+ regress once the grouped
-      // tiles outgrow L2.
+      // Group reduction steps: each iteration of a reduction loop re-reads
+      // and re-writes the whole accumulator tile, which has usually been
+      // evicted by the other output tiles visited in between, and when the
+      // serial reduction loop has parallel loops inside, every iteration
+      // also joins the thread pool. Grouping divides both fixed costs by the
+      // group size at the price of exceeding the tile area budget by the
+      // same factor. The join cost scales with the thread count while the
+      // cache overshoot doesn't, so the sweet spot moves with threads.
+      // Measured on the fused blockwise dot (m=256/n=4096/k=4096 bs=32,
+      // 9900X, ms):
+      //            1 thread   4 threads   8 threads
+      //   group=1    22.9        -           9.8
+      //   group=2    19.4        6.5         6.3
+      //   group=4    20.0        5.7         4.5
+      //   group=8    22.5        8.7         5.6
       // Only splits that are provably 1 are raised: wrapping an already
       // whole-extent symbolic split in max() changed the step into an
       // expression the loop rewriter couldn't reason about and produced
       // overlapping reduction crops (double-counted elements). A provably-1
       // split is also the only case the grouping can help. Packed sub-byte
       // dimension 0 is left alone: its step granularity is a storage byte.
+      const int max_threads =
+          runtime.threadpool() ? runtime.threadpool()->thread_count() + 1 : 1;
+      const slinky::index_t group = max_threads > 1 ? 4 : 2;
       const int elem_count = type_element_count(input_a.type);
       for (int i = 0; i < input_a.rank(); ++i) {
         if (!op.k_dims[i]) continue;
         if (i == 0 && elem_count != 1) continue;
         if (!phys_extents[i].defined() || !splits[i].defined()) continue;
         if (!slinky::is_constant(splits[i], 1)) continue;
-        // min(2, max(extent, 1)) never exceeds the extent and stays at least
-        // 1 for empty runtime extents (a step of 0 would never terminate).
+        // min(group, max(extent, 1)) never exceeds the extent and stays at
+        // least 1 for empty runtime extents (a step of 0 would never
+        // terminate).
         splits[i] = slinky::simplify(
-            slinky::min(2, slinky::max(phys_extents[i], 1)));
+            slinky::min(group, slinky::max(phys_extents[i], 1)));
       }
       sched = runtime.make_schedule(all_dims, phys_extents, splits,
                                     /*loop_order=*/{});
