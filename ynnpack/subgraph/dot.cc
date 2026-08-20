@@ -965,10 +965,16 @@ std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
   };
   slinky::expr splits = slinky::call::make(impl, {m, n, k, block_n});
 
-  // Extract the splits from the single index_t result.
-  splits = runtime.globals.get(splits, "dot_splits");
-  slinky::expr split_m = splits / 65536;
-  slinky::expr split_n = splits % 65536;
+  // If the shape is static, the call folds to a constant, which makes the
+  // splits provable for the scheduler (and removes a global let from the
+  // pipeline).
+  splits = slinky::simplify(splits);
+  if (!slinky::as_constant(splits)) {
+    // Extract the splits from the single index_t result.
+    splits = runtime.globals.get(splits, "dot_splits");
+  }
+  slinky::expr split_m = slinky::simplify(splits / 65536);
+  slinky::expr split_n = slinky::simplify(splits % 65536);
 
   // Trade-offs for splitting k:
   // - Benefit: For very large values of k, splitting the reduction dimension
