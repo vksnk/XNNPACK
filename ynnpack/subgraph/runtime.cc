@@ -78,43 +78,65 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     // Nothing to schedule here.
     return {};
   }
+  params.dims.assign(dims.begin(), dims.end());
+
+  // Build the loop splits in the declared loop order, with steps only for
+  // the given splits. The remaining steps are computed by schedule() (see
+  // compute_declared_steps), which runs before matching and can eventually
+  // use global (cross-function) context.
+  auto get_loop_dim = [&](int index_d) {
+    return index_d < params.loop_order.size() ? params.loop_order[index_d]
+                                              : index_d;
+  };
+  std::vector<ynn::scheduling_split> loop_splits;
+  for (int index_d = 0; index_d < rank; ++index_d) {
+    int d = get_loop_dim(index_d);
+    if (d >= params.extents.size() || !params.extents[d].defined()) continue;
+    if (d < params.given_splits.size()) {
+      // A given split that is undefined means "no loop for this dimension".
+      if (!params.given_splits[d].defined()) continue;
+      loop_splits.push_back(
+          {dims[d], params.given_splits[d], params.extents[d]});
+    } else {
+      loop_splits.push_back({dims[d], slinky::expr(), params.extents[d]});
+    }
+  }
+
+  auto sched = std::make_unique<ynn::scheduling_info>();
+  sched->loop_splits = std::move(loop_splits);
+  sched->params = std::move(params);
+  return sched;
+}
+
+void ynn_runtime::compute_declared_steps(ynn::scheduling_info& sched) {
+  const ynn::schedule_params& params = sched.params;
+  const int rank = params.dims.size();
 
   std::vector<slinky::expr> splits =
       make_split_factors(globals, params.extents, params.element_cost,
                          params.given_splits, params.loop_order,
                          params.alignments);
 
-  auto sched = make_schedule(dims, params.extents, splits, params.loop_order);
-  if (sched) {
-    sched->params = std::move(params);
-  }
-  return sched;
-}
-
-std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
-    ynn::span<const slinky::var> dims, ynn::span<const slinky::expr> extents,
-    ynn::span<const slinky::expr> splits, ynn::span<const int> loop_order) {
-  const int rank = dims.size();
-  if (rank <= 0) {
-    // Nothing to schedule here.
-    return {};
-  }
-
+  // Assign the computed steps to the loop splits left undefined, walking the
+  // dimensions in the same declared order the splits were built in.
   auto get_loop_dim = [&](int index_d) {
-    return index_d < loop_order.size() ? loop_order[index_d] : index_d;
+    return index_d < params.loop_order.size() ? params.loop_order[index_d]
+                                              : index_d;
   };
-
-  std::vector<ynn::scheduling_split> loop_splits;
+  size_t cursor = 0;
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
-    if (extents[d].defined() && splits[d].defined()) {
-      loop_splits.push_back({dims[d], splits[d], extents[d]});
+    if (d >= params.extents.size() || !params.extents[d].defined()) continue;
+    if (d < params.given_splits.size() && !params.given_splits[d].defined()) {
+      continue;
     }
+    assert(cursor < sched.loop_splits.size() &&
+           sched.loop_splits[cursor].var == params.dims[d]);
+    if (!sched.loop_splits[cursor].step.defined()) {
+      sched.loop_splits[cursor].step = splits[d];
+    }
+    ++cursor;
   }
-
-  auto scheduling_info = std::make_unique<ynn::scheduling_info>();
-  scheduling_info->loop_splits = std::move(loop_splits);
-  return scheduling_info;
 }
 
 namespace {
@@ -477,6 +499,17 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
 //    func-s. This is done in a separate loop once all of the functions from
 //    the pipeline were processed.
 void ynn_runtime::schedule() {
+  // Compute the steps of the declared (not given) splits. Functions declare
+  // their scheduling inputs at create time (see schedule_params); the steps
+  // are computed here, in creation order, so the computation can later use
+  // global (cross-function) context.
+  for (slinky::func& f : funcs) {
+    auto* sched = static_cast<ynn::scheduling_info*>(f.user_data());
+    if (sched && !sched->params.dims.empty()) {
+      compute_declared_steps(*sched);
+    }
+  }
+
   // This a list of indices of consumers of a given buffer.
   std::map<slinky::var, std::vector<int>> consumers;
   // This is a tree representing a global loop nest of a whole pipeline so

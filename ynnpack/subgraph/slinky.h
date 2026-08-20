@@ -152,6 +152,8 @@ struct scheduling_split {
 // global (cross-function) context. All vectors are positional by dimension
 // and may be shorter than the rank.
 struct schedule_params {
+  // The dimension variables, filled by make_schedule from its argument.
+  std::vector<slinky::var> dims;
   // Physical extents of the dimensions. Dimensions with undefined extents get
   // no loop.
   std::vector<slinky::expr> extents;
