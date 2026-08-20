@@ -606,7 +606,8 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       constexpr slinky::index_t budget_elems = (1 << 20) / 16;
       const slinky::index_t chain_pressure_tile = std::max<slinky::index_t>(
           64, budget_elems / std::max<slinky::index_t>(other_pure_product, 1));
-      if (constant_pure_extents && chain_pressure_tile < first_pure_extent) {
+      if (constant_pure_extents && chain_pressure_tile < first_pure_extent &&
+          other_pure_product > 1) {
         const slinky::index_t tile = chain_pressure_tile;
         std::vector<int> loop_order;
         loop_order.reserve(input_a.rank());

@@ -130,7 +130,7 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     if (constant_extents) {
       const slinky::index_t tile = std::max<slinky::index_t>(
           64, budget_elems / std::max<slinky::index_t>(other_product, 1));
-      if (tile < first_extent) {
+      if (tile < first_extent && other_product > 1) {
         std::vector<slinky::expr> splits(rank);
         first = true;
         for (int d = 0; d < rank; ++d) {
