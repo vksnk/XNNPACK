@@ -82,6 +82,54 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     return {};
   }
 
+  // PROTOTYPE: YNN_CHAIN_TILES=<t> makes functions without their own split
+  // requirements choose consistent tiles: the innermost defined dimension is
+  // tiled by t and the remaining dimensions are covered whole, so members of
+  // a fused chain declare the same steps and matching needs no overrides.
+  static const slinky::index_t chain_tile = [] {
+    const char* env = getenv("YNN_CHAIN_TILES");
+    return env ? atoll(env) : 0;
+  }();
+  if (chain_tile > 0 && given_splits.empty() && loop_order.empty()) {
+    // The tile of the innermost dimension is derived from a footprint
+    // budget: the fused chain's live set is roughly tile * (product of the
+    // other, whole dimensions) * bytes-per-element-ish, so
+    // tile = budget / product keeps it cache-resident. Small outputs (e.g.
+    // m=1 decode rows) get whole dimensions, large ones get ~256-element
+    // tiles. Requires constant extents; fall back otherwise.
+    constexpr slinky::index_t budget_elems = (1 << 20) / 16;
+    slinky::index_t other_product = 1;
+    bool constant_extents = true;
+    bool first = true;
+    for (int d = 0; d < rank; ++d) {
+      if (!extents[d].defined()) continue;
+      if (first) {
+        first = false;
+        continue;
+      }
+      if (auto c = slinky::as_constant(extents[d])) {
+        other_product *= *c;
+      } else {
+        constant_extents = false;
+        break;
+      }
+    }
+    if (constant_extents) {
+      const slinky::index_t tile = std::max<slinky::index_t>(
+          64, budget_elems / std::max<slinky::index_t>(other_product, 1));
+      std::vector<slinky::expr> splits(rank);
+      first = true;
+      for (int d = 0; d < rank; ++d) {
+        if (!extents[d].defined()) continue;
+        splits[d] = first ? slinky::simplify(slinky::min(
+                                tile, slinky::max(extents[d], 1)))
+                          : extents[d];
+        first = false;
+      }
+      return make_schedule(dims, extents, splits, loop_order);
+    }
+  }
+
   std::vector<slinky::expr> splits = make_split_factors(
       globals, extents, element_cost, given_splits, loop_order);
 

@@ -553,20 +553,87 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       const int max_threads =
           runtime.threadpool() ? runtime.threadpool()->thread_count() + 1 : 1;
       const slinky::index_t group = max_threads > 1 ? 4 : 2;
-      const int elem_count = type_element_count(input_a.type);
-      for (int i = 0; i < input_a.rank(); ++i) {
-        if (!op.k_dims[i]) continue;
-        if (i == 0 && elem_count != 1) continue;
-        if (!phys_extents[i].defined() || !splits[i].defined()) continue;
-        if (!slinky::is_constant(splits[i], 1)) continue;
-        // min(group, max(extent, 1)) never exceeds the extent and stays at
-        // least 1 for empty runtime extents (a step of 0 would never
-        // terminate).
-        splits[i] = slinky::simplify(
-            slinky::min(group, slinky::max(phys_extents[i], 1)));
+      // PROTOTYPE: YNN_CHAIN_TILES=<t> schedules the reduction loops
+      // innermost (pure loops outer, so the accumulator stays resident
+      // across the whole reduction and threads own an output slice without
+      // per-step joins), with the first pure dimension tiled by t to match
+      // the elementwise members of the chain and the remaining pure
+      // dimensions covered whole.
+      static const slinky::index_t chain_tile = [] {
+        const char* env = getenv("YNN_CHAIN_TILES");
+        return env ? atoll(env) : 0;
+      }();
+      // The first pure dimension's tile is derived from the same footprint
+      // budget as the elementwise members (see make_schedule), so the chain
+      // declares consistent steps. Requires constant pure extents.
+      slinky::index_t other_pure_product = 1;
+      bool constant_pure_extents = chain_tile > 0;
+      if (constant_pure_extents) {
+        bool first_pure = true;
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (op.k_dims[i] || !phys_extents[i].defined()) continue;
+          if (first_pure) {
+            first_pure = false;
+            continue;
+          }
+          if (auto c = slinky::as_constant(phys_extents[i])) {
+            other_pure_product *= *c;
+          } else {
+            constant_pure_extents = false;
+            break;
+          }
+        }
       }
-      sched = runtime.make_schedule(all_dims, phys_extents, splits,
-                                    /*loop_order=*/{});
+      if (constant_pure_extents) {
+        constexpr slinky::index_t budget_elems = (1 << 20) / 16;
+        const slinky::index_t tile = std::max<slinky::index_t>(
+            64,
+            budget_elems / std::max<slinky::index_t>(other_pure_product, 1));
+        std::vector<int> loop_order;
+        loop_order.reserve(input_a.rank());
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (op.k_dims[i]) loop_order.push_back(i);
+        }
+        bool first_pure = true;
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (op.k_dims[i]) continue;
+          loop_order.push_back(i);
+          if (phys_extents[i].defined()) {
+            splits[i] = first_pure
+                            ? slinky::simplify(slinky::min(
+                                  tile, slinky::max(phys_extents[i], 1)))
+                            : phys_extents[i];
+            first_pure = false;
+          }
+        }
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (!op.k_dims[i] || !phys_extents[i].defined()) continue;
+          // Never lower a computed split (see the grouping notes below); only
+          // raise provably-constant ones to the group size.
+          if (auto c = slinky::as_constant(splits[i])) {
+            splits[i] = slinky::simplify(slinky::max(
+                slinky::expr(*c),
+                slinky::min(group, slinky::max(phys_extents[i], 1))));
+          }
+        }
+        sched = runtime.make_schedule(all_dims, phys_extents, splits,
+                                      loop_order);
+      } else {
+        const int elem_count = type_element_count(input_a.type);
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (!op.k_dims[i]) continue;
+          if (i == 0 && elem_count != 1) continue;
+          if (!phys_extents[i].defined() || !splits[i].defined()) continue;
+          if (!slinky::is_constant(splits[i], 1)) continue;
+          // min(group, max(extent, 1)) never exceeds the extent and stays at
+          // least 1 for empty runtime extents (a step of 0 would never
+          // terminate).
+          splits[i] = slinky::simplify(
+              slinky::min(group, slinky::max(phys_extents[i], 1)));
+        }
+        sched = runtime.make_schedule(all_dims, phys_extents, splits,
+                                      /*loop_order=*/{});
+      }
     } else {
       sched = runtime.make_schedule(all_dims, phys_extents,
                                     input_a.buffer->elem_size(), split_factors);
