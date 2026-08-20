@@ -606,6 +606,12 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
             first_pure = false;
           }
         }
+        // With the reduction loops innermost there are no per-step pool
+        // joins (the parallel pure loops are outside), so the thread-aware
+        // group size of the reduction-outermost path does not apply; pairs
+        // are enough to amortize the per-step call overhead and keep the
+        // per-step footprint small.
+        const slinky::index_t inner_group = 2;
         for (int i = 0; i < input_a.rank(); ++i) {
           if (!op.k_dims[i] || !phys_extents[i].defined()) continue;
           // Never lower a computed split (see the grouping notes below); only
@@ -613,7 +619,7 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
           if (auto c = slinky::as_constant(splits[i])) {
             splits[i] = slinky::simplify(slinky::max(
                 slinky::expr(*c),
-                slinky::min(group, slinky::max(phys_extents[i], 1))));
+                slinky::min(inner_group, slinky::max(phys_extents[i], 1))));
           }
         }
         sched = runtime.make_schedule(all_dims, phys_extents, splits,
