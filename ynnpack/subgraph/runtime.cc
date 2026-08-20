@@ -609,14 +609,18 @@ void ynn_runtime::schedule() {
               // splits across it either.
               break;
             }
-            if (split.step_is_required && out_of_order) {
+            if (split.step_is_required && out_of_order &&
+                !(global_loop.step.defined() &&
+                  slinky::prove_true(split.step == global_loop.step))) {
               // A required step means the function deliberately chose the
               // blocking of this loop, and the loop order is likely a part of
               // the same deliberate choice. Matching it out of order would
               // impose that blocking on a nest built for a different order
               // (e.g. pull a dot under the loops of its elementwise consumer,
               // overriding the consumer's steps with the dot's tiles), so we
-              // only allow such splits to be matched in their declared order.
+              // only allow such splits to be matched in their declared order —
+              // unless the loop's step is provably already the required step,
+              // in which case the match imposes nothing on the nest.
               continue;
             }
             // Map the producer's loop variable back to its output dimension
