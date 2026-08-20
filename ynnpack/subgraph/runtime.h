@@ -75,11 +75,22 @@ struct ynn_runtime {
       ynn::span<const slinky::expr> splits,
       ynn::span<const int> loop_order = {});
 
+  // Computes the loop steps for a function from its declared scheduling
+  // inputs (see schedule_params) and returns the resulting scheduling_info,
+  // with the declaration stored on it.
+  std::unique_ptr<ynn::scheduling_info> make_schedule(
+      ynn::span<const slinky::var> dims, ynn::schedule_params params);
+
+  // Convenience form of the above for functions that only declare extents
+  // and an element cost.
   std::unique_ptr<ynn::scheduling_info> make_schedule(
       ynn::span<const slinky::var> dims, ynn::span<const slinky::expr> extents,
-      const slinky::expr& element_cost,
-      ynn::span<const slinky::expr> given_splits = {},
-      ynn::span<const int> loop_order = {});
+      const slinky::expr& element_cost) {
+    ynn::schedule_params params;
+    params.extents.assign(extents.begin(), extents.end());
+    params.element_cost = element_cost;
+    return make_schedule(dims, std::move(params));
+  }
 
   slinky::buffer_expr_ptr null_buffer();
 

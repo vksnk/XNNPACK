@@ -72,20 +72,71 @@ void ynn_runtime_value::make_buffer(ynn_runtime& runtime) {
 }
 
 std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
-    ynn::span<const slinky::var> dims, ynn::span<const slinky::expr> extents,
-    const slinky::expr& element_cost,
-    ynn::span<const slinky::expr> given_splits,
-    ynn::span<const int> loop_order) {
+    ynn::span<const slinky::var> dims, ynn::schedule_params params) {
   const int rank = dims.size();
   if (rank <= 0) {
     // Nothing to schedule here.
     return {};
   }
 
-  std::vector<slinky::expr> splits = make_split_factors(
-      globals, extents, element_cost, given_splits, loop_order);
+  std::vector<slinky::expr> splits =
+      make_split_factors(globals, params.extents, params.element_cost,
+                         params.given_splits, params.loop_order,
+                         params.alignments);
 
-  return make_schedule(dims, extents, splits, loop_order);
+  // Declare computed reduction loops innermost. A reduction loop is always
+  // serial, so leaving it outside the (parallel) pure loops joins the thread
+  // pool on every step; it is also a matching fence, so an early reduction
+  // loop blocks the pure loops behind it from fusing. Splits keep their
+  // positional computation.
+  if (params.loop_order.empty()) {
+    bool any_computed_reduction = false;
+    for (int d = static_cast<int>(params.given_splits.size()); d < rank; ++d) {
+      if (d < static_cast<int>(params.extents.size()) &&
+          params.extents[d].defined() && !globals.is_pure_dim(dims[d])) {
+        any_computed_reduction = true;
+      }
+    }
+    if (any_computed_reduction) {
+      std::vector<int> order;
+      order.reserve(rank);
+      for (int d = 0; d < rank; ++d) {
+        if (!globals.is_pure_dim(dims[d])) order.push_back(d);
+      }
+      for (int d = 0; d < rank; ++d) {
+        if (globals.is_pure_dim(dims[d])) order.push_back(d);
+      }
+      params.loop_order = std::move(order);
+      // The splits above were computed with the positional handout, where
+      // the pure dimensions claim the tile area first; a reduction dimension
+      // can be left with a split of 1, which the reorder then makes an
+      // innermost serial loop invoking the fused body per single reduction
+      // element. Raise such splits to pairs, halving that overhead at the
+      // price of doubling the fused tile. Only provably-1 splits are raised
+      // (never lower or wrap a computed split): larger floors help some
+      // shapes but overshoot the budget of fused chains whose other
+      // reduction steps were computed above 1 (blockwise m=256 regressed
+      // 7-27% at floors of 4-8 via its colsum's step of 2).
+      for (int d = 0; d < rank; ++d) {
+        if (globals.is_pure_dim(dims[d])) continue;
+        if (d < static_cast<int>(params.given_splits.size())) continue;
+        if (d >= static_cast<int>(params.extents.size()) ||
+            !params.extents[d].defined() || !splits[d].defined()) {
+          continue;
+        }
+        if (slinky::is_constant(splits[d], 1)) {
+          splits[d] = slinky::simplify(
+              slinky::min(2, slinky::max(params.extents[d], 1)));
+        }
+      }
+    }
+  }
+
+  auto sched = make_schedule(dims, params.extents, splits, params.loop_order);
+  if (sched) {
+    sched->params = std::move(params);
+  }
+  return sched;
 }
 
 std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(

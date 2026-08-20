@@ -28,6 +28,7 @@
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/utils.h"
 #include "slinky/base/arithmetic.h"
+#include "slinky/base/thread_pool.h"
 #include "slinky/builder/pipeline.h"
 #include "slinky/builder/simplify.h"
 #include "slinky/runtime/buffer.h"
@@ -514,57 +515,21 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       attrs.allow_in_place = (1 << 1);
     }
 
-    // Schedule the computed reduction loops innermost. A reduction loop is
-    // always serial, so leaving it outside the (parallel) pure loops joins
-    // the thread pool on every step; it is also a matching fence, so an
-    // early reduction loop blocks the pure loops behind it from fusing. The
-    // splits keep their positional computation (a partial reduction's given
-    // pr_split loops are pure and stay as declared).
-    std::vector<slinky::expr> phys_extents = input_a.physical_extents();
-    std::unique_ptr<ynn::scheduling_info> sched;
-    bool computed_reduction = false;
-    for (size_t d = split_factors.size(); d < all_dims.size(); ++d) {
-      if (phys_extents[d].defined() &&
-          !runtime.globals.is_pure_dim(all_dims[d])) {
-        computed_reduction = true;
-      }
-    }
-    if (computed_reduction) {
-      std::vector<slinky::expr> splits =
-          make_split_factors(runtime.globals, phys_extents,
-                             input_a.buffer->elem_size(), split_factors);
-      std::vector<int> order;
-      order.reserve(all_dims.size());
-      for (size_t d = 0; d < all_dims.size(); ++d) {
-        if (!runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
-      }
-      for (size_t d = 0; d < all_dims.size(); ++d) {
-        if (runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
-      }
-      // The splits above were computed with the positional handout, where
-      // the pure dimensions claim the tile area first; a reduction dimension
-      // can be left with a split of 1, which the reorder then makes an
-      // innermost serial loop invoking the fused body per single reduction
-      // element. Raise such splits to pairs, halving that overhead at the
-      // price of doubling the fused tile. Only provably-1 splits are raised
-      // (never lower or wrap a computed split): larger floors help some
-      // shapes but overshoot the budget of fused chains whose other
-      // reduction steps were computed above 1 (blockwise m=256 regressed
-      // 7-27% at floors of 4-8 via its colsum's step of 2).
-      for (size_t d = 0; d < all_dims.size(); ++d) {
-        if (runtime.globals.is_pure_dim(all_dims[d])) continue;
-        if (d < split_factors.size()) continue;
-        if (!phys_extents[d].defined() || !splits[d].defined()) continue;
-        if (slinky::is_constant(splits[d], 1)) {
-          splits[d] = slinky::simplify(
-              slinky::min(2, slinky::max(phys_extents[d], 1)));
-        }
-      }
-      sched = runtime.make_schedule(all_dims, phys_extents, splits, order);
-    } else {
-      sched = runtime.make_schedule(all_dims, phys_extents,
-                                    input_a.buffer->elem_size(), split_factors);
-    }
+    // NOTE: when no split_factors were given, the steps are computed without
+    // the reservation floors from compute_reduce_alignments, so a reduction
+    // dimension that is not innermost can end up with a step of 1. Applying
+    // here was tried and measured 4x slower on the fused blockwise dot: with
+    // producers fused into the reduction loop, a step of 1 streams one block
+    // at a time through a cache-sized live set, while the floored step
+    // materializes the whole reduction extent of the intermediate. Choosing
+    // the reduction step from the fused working set is step reconciliation's
+    // job.
+    ynn::schedule_params params;
+    params.extents = input_a.physical_extents();
+    params.element_cost = input_a.buffer->elem_size();
+    params.given_splits = split_factors;
+    std::unique_ptr<ynn::scheduling_info> sched =
+        runtime.make_schedule(all_dims, std::move(params));
 
     auto func = slinky::func::make(
         make_unary_reduce_impl(op, kernel),
