@@ -584,11 +584,30 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
           }
         }
       }
+      // Only reorder under footprint pressure: when the budget-derived tile
+      // covers the first pure dimension whole, the fused working set fits
+      // as-is and the default reduction-outermost order stands. (Without
+      // pressure the reordering can also break fusion: a producer with a
+      // required tile of its own must match the whole-extent outer level
+      // before it can reach the reduction loop, and there is nothing to
+      // match it against.)
+      slinky::index_t first_pure_extent = 0;
       if (constant_pure_extents) {
-        constexpr slinky::index_t budget_elems = (1 << 20) / 16;
-        const slinky::index_t tile = std::max<slinky::index_t>(
-            64,
-            budget_elems / std::max<slinky::index_t>(other_pure_product, 1));
+        for (int i = 0; i < input_a.rank(); ++i) {
+          if (op.k_dims[i] || !phys_extents[i].defined()) continue;
+          if (auto c = slinky::as_constant(phys_extents[i])) {
+            first_pure_extent = *c;
+          } else {
+            constant_pure_extents = false;
+          }
+          break;
+        }
+      }
+      constexpr slinky::index_t budget_elems = (1 << 20) / 16;
+      const slinky::index_t chain_pressure_tile = std::max<slinky::index_t>(
+          64, budget_elems / std::max<slinky::index_t>(other_pure_product, 1));
+      if (constant_pure_extents && chain_pressure_tile < first_pure_extent) {
+        const slinky::index_t tile = chain_pressure_tile;
         std::vector<int> loop_order;
         loop_order.reserve(input_a.rank());
         for (int i = 0; i < input_a.rank(); ++i) {

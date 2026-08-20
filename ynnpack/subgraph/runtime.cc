@@ -114,19 +114,34 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
         break;
       }
     }
+    // Mirror the reduce's footprint-pressure gate: without pressure (the
+    // tile covers the first dimension whole) the default policy stands, so
+    // chain members stay consistent with the reduce's fallback too.
+    slinky::index_t first_extent = 0;
+    for (int d = 0; d < rank && constant_extents; ++d) {
+      if (!extents[d].defined()) continue;
+      if (auto c = slinky::as_constant(extents[d])) {
+        first_extent = *c;
+      } else {
+        constant_extents = false;
+      }
+      break;
+    }
     if (constant_extents) {
       const slinky::index_t tile = std::max<slinky::index_t>(
           64, budget_elems / std::max<slinky::index_t>(other_product, 1));
-      std::vector<slinky::expr> splits(rank);
-      first = true;
-      for (int d = 0; d < rank; ++d) {
-        if (!extents[d].defined()) continue;
-        splits[d] = first ? slinky::simplify(slinky::min(
-                                tile, slinky::max(extents[d], 1)))
-                          : extents[d];
-        first = false;
+      if (tile < first_extent) {
+        std::vector<slinky::expr> splits(rank);
+        first = true;
+        for (int d = 0; d < rank; ++d) {
+          if (!extents[d].defined()) continue;
+          splits[d] = first ? slinky::simplify(slinky::min(
+                                  tile, slinky::max(extents[d], 1)))
+                            : extents[d];
+          first = false;
+        }
+        return make_schedule(dims, extents, splits, loop_order);
       }
-      return make_schedule(dims, extents, splits, loop_order);
     }
   }
 
