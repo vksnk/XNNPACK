@@ -28,6 +28,7 @@
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/utils.h"
 #include "slinky/base/arithmetic.h"
+#include "slinky/base/thread_pool.h"
 #include "slinky/builder/pipeline.h"
 #include "slinky/builder/simplify.h"
 #include "slinky/runtime/buffer.h"
@@ -514,9 +515,21 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       attrs.allow_in_place = (1 << 1);
     }
 
-    auto sched =
-        runtime.make_schedule(all_dims, input_a.physical_extents(),
-                              input_a.buffer->elem_size(), split_factors);
+    // NOTE: when no split_factors were given, the steps are computed without
+    // the reservation floors from compute_reduce_alignments, so a reduction
+    // dimension that is not innermost can end up with a step of 1. Applying
+    // here was tried and measured 4x slower on the fused blockwise dot: with
+    // producers fused into the reduction loop, a step of 1 streams one block
+    // at a time through a cache-sized live set, while the floored step
+    // materializes the whole reduction extent of the intermediate. Choosing
+    // the reduction step from the fused working set is step reconciliation's
+    // job.
+    ynn::schedule_params params;
+    params.extents = input_a.physical_extents();
+    params.element_cost = input_a.buffer->elem_size();
+    params.given_splits = split_factors;
+    std::unique_ptr<ynn::scheduling_info> sched =
+        runtime.make_schedule(all_dims, std::move(params));
 
     auto func = slinky::func::make(
         make_unary_reduce_impl(op, kernel),

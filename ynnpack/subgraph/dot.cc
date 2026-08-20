@@ -742,11 +742,12 @@ uint32_t define_pack_b(ynn_subgraph& subgraph, const dot_type& type,
     // nest (e.g. when it is constant folded). When it is fused, the splits
     // don't require their steps, so they adopt the loops of the dot as
     // before.
-    std::vector<slinky::expr> given_splits = {output.physical_extent(0),
-                                              output.physical_extent(1)};
-    auto sched =
-        runtime.make_schedule(dims, output.physical_extents(),
-                              output.buffer->elem_size(), given_splits);
+    ynn::schedule_params params;
+    params.extents = output.physical_extents();
+    params.element_cost = output.buffer->elem_size();
+    params.given_splits = {output.physical_extent(0),
+                           output.physical_extent(1)};
+    auto sched = runtime.make_schedule(dims, std::move(params));
     sched->loop_splits[0].step_is_required = true;
     sched->loop_splits[1].step_is_required = true;
 
@@ -1515,8 +1516,12 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       splits.push_back(split_m);
     }
 
-    auto sched = runtime.make_schedule(
-        all_dims, all_extents, output.buffer->elem_size(), splits, loop_order);
+    ynn::schedule_params params;
+    params.extents = all_extents;
+    params.element_cost = output.buffer->elem_size();
+    params.given_splits = std::move(splits);
+    params.loop_order = std::move(loop_order);
+    auto sched = runtime.make_schedule(all_dims, std::move(params));
 
     // We want to use exactly these loop splits for two innermost dot loops.
     for (size_t dim_idx = 0; dim_idx < std::min<size_t>(output_dims.size(), 2);

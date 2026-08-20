@@ -146,6 +146,29 @@ struct scheduling_split {
   bool step_is_required = false;
 };
 
+// The declarative inputs a function provides for computing its loop steps.
+// Functions describe their dimensions here and leave the step computation to
+// make_schedule, so the policy lives in one place and can eventually use
+// global (cross-function) context. All vectors are positional by dimension
+// and may be shorter than the rank.
+struct schedule_params {
+  // Physical extents of the dimensions. Dimensions with undefined extents get
+  // no loop.
+  std::vector<slinky::expr> extents;
+  // The cost of one element, used to derive the tile area (typically the
+  // element size in bytes).
+  slinky::expr element_cost;
+  // Splits the function chose itself: a defined entry is used as-is, an
+  // undefined entry within the vector means "no loop for this dimension".
+  // Dimensions beyond the vector get computed splits.
+  std::vector<slinky::expr> given_splits;
+  // The order in which dimensions claim the tile area and appear in the
+  // declared loop order (indices into the dimensions).
+  std::vector<int> loop_order;
+  // Split alignments, see make_split_factors.
+  std::vector<slinky::expr> alignments;
+};
+
 // A scheduling information for a buffer -- it's expected to be attached to the
 // scheduling_info of the function.
 struct scheduled_buffer {
@@ -169,6 +192,11 @@ struct scheduling_info {
   // A set of loop splits for a given function.
   std::vector<scheduling_split> loop_splits;
   std::vector<scheduled_buffer> scheduled_buffers;
+
+  // The declarative inputs the steps of `loop_splits` were computed from,
+  // kept so the global scheduler can recompute them with cross-function
+  // context. Empty for functions that build their scheduling_info by hand.
+  schedule_params params;
 
   // Scheduler-only bounds for the inputs of this function, used by the
   // scheduler's source region inference in place of the function's real input
