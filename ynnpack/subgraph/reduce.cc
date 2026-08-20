@@ -518,12 +518,12 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
     // NOTE: when no split_factors were given, the steps are computed without
     // the reservation floors from compute_reduce_alignments, so a reduction
     // dimension that is not innermost can end up with a step of 1. Applying
-    // here was tried and measured 4x slower on the fused blockwise dot: with
-    // producers fused into the reduction loop, a step of 1 streams one block
-    // at a time through a cache-sized live set, while the floored step
-    // materializes the whole reduction extent of the intermediate. Choosing
-    // the reduction step from the fused working set is step reconciliation's
-    // job.
+    // the floors here was tried and measured 4x slower on the fused blockwise
+    // dot: with producers fused into the reduction loop, a step of 1 streams
+    // one block at a time through a cache-sized live set, while the floored
+    // step materializes the whole reduction extent of the intermediate.
+    // Choosing the reduction step from the fused working set is the chain
+    // reconciliation's job.
     ynn::schedule_params params;
     params.extents = input_a.physical_extents();
     params.element_cost = input_a.buffer->elem_size();

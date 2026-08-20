@@ -747,9 +747,8 @@ uint32_t define_pack_b(ynn_subgraph& subgraph, const dot_type& type,
     params.element_cost = output.buffer->elem_size();
     params.given_splits = {output.physical_extent(0),
                            output.physical_extent(1)};
+    params.step_required = {true, true};
     auto sched = runtime.make_schedule(dims, std::move(params));
-    sched->loop_splits[0].step_is_required = true;
-    sched->loop_splits[1].step_is_required = true;
 
     // TODO(vksnk): This is a temporary workaround to avoid recomputing packed
     // buffer. The proper fix would probably involve adding a loop splits for
@@ -1521,19 +1520,13 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
     params.element_cost = output.buffer->elem_size();
     params.given_splits = std::move(splits);
     params.loop_order = std::move(loop_order);
-    auto sched = runtime.make_schedule(all_dims, std::move(params));
-
-    // We want to use exactly these loop splits for two innermost dot loops.
-    for (size_t dim_idx = 0; dim_idx < std::min<size_t>(output_dims.size(), 2);
-         ++dim_idx) {
-      slinky::var sym = output_dims[dim_idx];
-      for (size_t i = 0; i < sched->loop_splits.size(); ++i) {
-        if (sched->loop_splits[i].var == sym) {
-          sched->loop_splits[i].step_is_required = true;
-          break;
-        }
-      }
+    // We want to use exactly these loop splits for the n and m dot loops.
+    params.step_required.resize(num_k_dims + 2, false);
+    params.step_required[num_k_dims] = true;
+    if (output.rank() >= 2) {
+      params.step_required[num_k_dims + 1] = true;
     }
+    auto sched = runtime.make_schedule(all_dims, std::move(params));
 
     // The real bounds of the packed input's blocks_n dimension are block
     // indices (j / block_n), which breaks the scheduler's source region

@@ -169,6 +169,9 @@ struct schedule_params {
   std::vector<int> loop_order;
   // Split alignments, see make_split_factors.
   std::vector<slinky::expr> alignments;
+  // Marks given splits whose step the function requires (see
+  // scheduling_split::step_is_required).
+  std::vector<bool> step_required;
 };
 
 // A scheduling information for a buffer -- it's expected to be attached to the

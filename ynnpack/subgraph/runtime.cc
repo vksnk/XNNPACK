@@ -80,30 +80,10 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
   }
   params.dims.assign(dims.begin(), dims.end());
 
-  // Build the loop splits in the declared loop order, with steps only for
-  // the given splits. The remaining steps are computed by schedule() (see
-  // compute_declared_steps), which runs before matching and can eventually
-  // use global (cross-function) context.
-  auto get_loop_dim = [&](int index_d) {
-    return index_d < params.loop_order.size() ? params.loop_order[index_d]
-                                              : index_d;
-  };
-  std::vector<ynn::scheduling_split> loop_splits;
-  for (int index_d = 0; index_d < rank; ++index_d) {
-    int d = get_loop_dim(index_d);
-    if (d >= params.extents.size() || !params.extents[d].defined()) continue;
-    if (d < params.given_splits.size()) {
-      // A given split that is undefined means "no loop for this dimension".
-      if (!params.given_splits[d].defined()) continue;
-      loop_splits.push_back(
-          {dims[d], params.given_splits[d], params.extents[d]});
-    } else {
-      loop_splits.push_back({dims[d], slinky::expr(), params.extents[d]});
-    }
-  }
-
+  // The loop splits are built and their steps computed by schedule() (see
+  // compute_declared_steps), which runs before matching and can use global
+  // (cross-function) context to adjust the declaration first.
   auto sched = std::make_unique<ynn::scheduling_info>();
-  sched->loop_splits = std::move(loop_splits);
   sched->params = std::move(params);
   return sched;
 }
@@ -117,26 +97,25 @@ void ynn_runtime::compute_declared_steps(ynn::scheduling_info& sched) {
                          params.given_splits, params.loop_order,
                          params.alignments);
 
-  // Assign the computed steps to the loop splits left undefined, walking the
-  // dimensions in the same declared order the splits were built in.
+  // Build the loop splits in the declared loop order. A given split that is
+  // undefined means "no loop for this dimension".
   auto get_loop_dim = [&](int index_d) {
     return index_d < params.loop_order.size() ? params.loop_order[index_d]
                                               : index_d;
   };
-  size_t cursor = 0;
+  std::vector<ynn::scheduling_split> loop_splits;
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
     if (d >= params.extents.size() || !params.extents[d].defined()) continue;
     if (d < params.given_splits.size() && !params.given_splits[d].defined()) {
       continue;
     }
-    assert(cursor < sched.loop_splits.size() &&
-           sched.loop_splits[cursor].var == params.dims[d]);
-    if (!sched.loop_splits[cursor].step.defined()) {
-      sched.loop_splits[cursor].step = splits[d];
-    }
-    ++cursor;
+    const bool required =
+        d < params.step_required.size() && params.step_required[d];
+    loop_splits.push_back(
+        {params.dims[d], splits[d], params.extents[d], required});
   }
+  sched.loop_splits = std::move(loop_splits);
 }
 
 namespace {
@@ -477,6 +456,293 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
   }
 }
 
+// Reconciles the loop steps of fused chains rooted at reductions. A
+// reduction under footprint pressure (the fused chain's live set exceeds the
+// cache-derived budget) wants its reduction loops innermost -- the
+// accumulator tile stays resident across the whole reduction, and with the
+// parallel pure loops outside there are no per-step thread pool joins --
+// with one consistently tiled pure loop shared by every member of the
+// chain. Measured on the fused blockwise dot (m=256/n=4096/k=4096 bs=32,
+// 9900X): 18.7 -> 16.4ms at 1 thread and 4.3 -> 2.4ms at 8 threads.
+//
+// The decision is made once, at the root: the members' declarations are
+// rewritten so the whole chain declares the same steps and matching needs no
+// overrides. Chains that contain a function with required steps that
+// provably differ from the planned steps are left alone -- imposing the
+// chain's tiles would unfuse that member (e.g. attention's QK dot feeding
+// softmax), and recomputing the materialized intermediate costs far more
+// than the reordering wins.
+
+// A function's defined dimensions, collected once per function so the chain
+// passes don't repeat the positional guards of schedule_params.
+struct chain_dim {
+  int d;  // Index into the schedule_params vectors.
+  slinky::expr extent;
+  bool pure;
+  int region;  // Inferred source region, or -1 if unknown.
+  std::optional<slinky::index_t> size;  // Constant extent, if known.
+};
+
+constexpr slinky::index_t chain_budget_elems = (1 << 20) / 16;
+
+// The budget-derived tile for dims[first], sized so that the fused body's
+// live set -- roughly tile * product of the other dimensions -- stays within
+// the budget. Returns nothing when there is no footprint pressure: the
+// extents are not all constant, there are no other dimensions to keep the
+// outer loops busy, or the tile covers the dimension whole.
+std::optional<slinky::index_t> footprint_tile(
+    ynn::span<const chain_dim> dims, size_t first) {
+  if (!dims[first].size) return std::nullopt;
+  slinky::index_t other = 1;
+  for (size_t j = 0; j < dims.size(); ++j) {
+    if (j == first) continue;
+    if (!dims[j].size) return std::nullopt;
+    other *= *dims[j].size;
+  }
+  if (other <= 1) return std::nullopt;
+  const slinky::index_t tile =
+      std::max<slinky::index_t>(64, chain_budget_elems / other);
+  if (tile >= *dims[first].size) return std::nullopt;
+  return tile;
+}
+
+slinky::expr make_tile_step(slinky::index_t tile, const slinky::expr& extent) {
+  return slinky::simplify(slinky::min(tile, slinky::max(extent, 1)));
+}
+
+void reconcile_chains(
+    ynn::slinky_globals& globals, std::vector<slinky::func>& funcs,
+    const std::map<std::pair<slinky::var, int>, int>& source_regions) {
+  auto sched_of = [&](int i) {
+    return static_cast<ynn::scheduling_info*>(funcs[i].user_data());
+  };
+
+  auto dims_of = [&](int i) {
+    const ynn::schedule_params& p = sched_of(i)->params;
+    std::vector<chain_dim> dims;
+    for (int d = 0; d < static_cast<int>(p.dims.size()); ++d) {
+      if (d >= static_cast<int>(p.extents.size()) || !p.extents[d].defined()) {
+        continue;
+      }
+      auto [buf, buf_dim] = find_output_dim(&funcs[i], p.dims[d]);
+      auto it = source_regions.find(std::make_pair(buf, buf_dim));
+      dims.push_back({d, p.extents[d], globals.is_pure_dim(p.dims[d]),
+                      it != source_regions.end() ? it->second : -1,
+                      slinky::as_constant(p.extents[d])});
+    }
+    return dims;
+  };
+
+  std::map<slinky::var, int> producer_of;
+  std::map<slinky::var, std::vector<int>> consumers_of;
+  for (int i = 0; i < static_cast<int>(funcs.size()); ++i) {
+    for (const auto& out : funcs[i].outputs()) {
+      producer_of[out.sym()] = i;
+    }
+    for (const auto& in : funcs[i].inputs()) {
+      consumers_of[in.sym()].push_back(i);
+    }
+  }
+
+  // A chain member's steps can be freely rewritten: it declares its
+  // scheduling inputs, chooses none of its splits itself (a partial
+  // reduction's pr_split loops must stay as declared), requires none of its
+  // steps, and is not pinned to root.
+  auto is_member = [&](int i) {
+    const ynn::scheduling_info* s = sched_of(i);
+    if (!s || s->force_root || s->params.dims.empty()) return false;
+    for (bool r : s->params.step_required) {
+      if (r) return false;
+    }
+    for (const slinky::expr& g : s->params.given_splits) {
+      if (g.defined()) return false;
+    }
+    return true;
+  };
+
+  // A function whose declaration includes reduction loops the scheduler
+  // chooses itself; each is the root of its own chain decision.
+  auto has_computed_reduction = [&](int i) {
+    const ynn::scheduling_info* s = sched_of(i);
+    if (!s) return false;
+    const ynn::schedule_params& p = s->params;
+    for (int d = static_cast<int>(p.given_splits.size());
+         d < static_cast<int>(p.dims.size()); ++d) {
+      if (d < static_cast<int>(p.extents.size()) && p.extents[d].defined() &&
+          !globals.is_pure_dim(p.dims[d])) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Collects the chain of `r`: every member reachable through
+  // producer/consumer edges between members. Other reductions are boundaries
+  // -- each makes its own chain decision -- and functions with required
+  // steps stop the walk and are recorded for the compatibility check.
+  // Returns false if the chain overlaps one that was already reconciled.
+  auto collect_chain = [&](int r, const std::vector<char>& claimed,
+                           std::vector<int>& members,
+                           std::vector<int>& required_boundary) {
+    std::vector<char> visited(funcs.size(), 0);
+    std::vector<int> worklist = {r};
+    visited[r] = 1;
+    bool ok = true;
+    auto visit = [&](int j) {
+      if (visited[j]) return;
+      visited[j] = 1;
+      if (j != r && has_computed_reduction(j)) return;
+      if (claimed[j]) {
+        // Already decided by another chain; do not re-tile it.
+        ok = false;
+      } else if (is_member(j)) {
+        worklist.push_back(j);
+      } else {
+        const ynn::scheduling_info* s = sched_of(j);
+        if (s && !s->params.step_required.empty()) {
+          required_boundary.push_back(j);
+        }
+      }
+    };
+    while (!worklist.empty() && ok) {
+      int i = worklist.back();
+      worklist.pop_back();
+      members.push_back(i);
+      for (const auto& in : funcs[i].inputs()) {
+        auto it = producer_of.find(in.sym());
+        if (it != producer_of.end()) visit(it->second);
+      }
+      for (const auto& out : funcs[i].outputs()) {
+        auto it = consumers_of.find(out.sym());
+        if (it == consumers_of.end()) continue;
+        for (int j : it->second) visit(j);
+      }
+    }
+    return ok;
+  };
+
+  std::vector<char> claimed(funcs.size(), 0);
+  for (int r = 0; r < static_cast<int>(funcs.size()); ++r) {
+    // A root is a reduction whose reduction loops the scheduler chooses
+    // itself (a partial reduction's given pr_split loops are pure and stay
+    // as declared).
+    if (!is_member(r) || claimed[r] || !has_computed_reduction(r)) continue;
+
+    // The chain's plan: the root's first pure dimension gets the footprint
+    // tile, its remaining pure dimensions stay whole. Everything is keyed by
+    // source region, which is how the matcher identifies shared loops.
+    std::vector<chain_dim> root_dims = dims_of(r);
+    std::vector<chain_dim> root_pure;
+    for (const chain_dim& dim : root_dims) {
+      if (dim.pure) root_pure.push_back(dim);
+    }
+    if (root_pure.empty() || root_pure[0].region == -1) continue;
+    std::optional<slinky::index_t> tile = footprint_tile(root_pure, 0);
+    if (!tile) continue;
+    std::map<int, slinky::expr> planned;
+    planned[root_pure[0].region] = make_tile_step(*tile, root_pure[0].extent);
+    for (size_t j = 1; j < root_pure.size(); ++j) {
+      if (root_pure[j].region != -1) {
+        planned.emplace(root_pure[j].region, root_pure[j].extent);
+      }
+    }
+
+    std::vector<int> members;
+    std::vector<int> required_boundary;
+    if (!collect_chain(r, claimed, members, required_boundary)) continue;
+
+    // Compatibility check: a boundary function's required steps must
+    // provably match the planned steps of the loops it shares with the
+    // chain, or fusing it would fail and materialize its output.
+    bool ok = true;
+    for (int q : required_boundary) {
+      const ynn::schedule_params& qp = sched_of(q)->params;
+      for (const chain_dim& dim : dims_of(q)) {
+        if (dim.d >= static_cast<int>(qp.step_required.size()) ||
+            !qp.step_required[dim.d] ||
+            dim.d >= static_cast<int>(qp.given_splits.size()) ||
+            !qp.given_splits[dim.d].defined()) {
+          continue;
+        }
+        auto it = planned.find(dim.region);
+        if (it != planned.end() &&
+            !slinky::prove_true(qp.given_splits[dim.d] == it->second)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) break;
+    }
+    if (!ok) continue;
+
+    // Rewrite the members' declarations so the whole chain declares the
+    // planned steps. Dimensions shared with the chain's loops get the
+    // planned steps (for the root's own pure dimensions this is the plan
+    // itself). A dimension of a member's own (e.g. the quantized row
+    // dimension of the dynamic quantization prologue, which the chain's
+    // loops never cover) gets a footprint tile of its own for the first
+    // such dimension -- the member may root its own nest there, and a whole
+    // extent would serialize it -- and whole extents for the rest.
+    for (int i : members) {
+      claimed[i] = 1;
+      ynn::schedule_params& mp = sched_of(i)->params;
+      std::vector<chain_dim> dims = dims_of(i);
+      std::vector<slinky::expr> given(mp.dims.size());
+      std::vector<slinky::expr> defaults;
+      if (i == r) {
+        // The root's reduction loops go innermost (pure loops outer). Their
+        // steps keep the computed defaults, raised to pairs when provably 1
+        // so the per-step call overhead is amortized -- never lowered.
+        defaults = make_split_factors(globals, mp.extents, mp.element_cost,
+                                      mp.given_splits, mp.loop_order,
+                                      mp.alignments);
+        std::vector<int> order;
+        order.reserve(dims.size());
+        for (const chain_dim& dim : dims) {
+          if (!dim.pure) order.push_back(dim.d);
+        }
+        for (const chain_dim& dim : dims) {
+          if (dim.pure) order.push_back(dim.d);
+        }
+        mp.loop_order = std::move(order);
+      }
+      std::vector<chain_dim> pure;
+      for (const chain_dim& dim : dims) {
+        if (dim.pure) pure.push_back(dim);
+      }
+      bool first_unshared = true;
+      for (size_t j = 0; j < dims.size(); ++j) {
+        const chain_dim& dim = dims[j];
+        if (!dim.pure) {
+          slinky::expr split = defaults[dim.d];
+          if (auto c = slinky::as_constant(split)) {
+            split = slinky::simplify(slinky::max(
+                slinky::expr(*c), slinky::min(2, slinky::max(dim.extent, 1))));
+          }
+          given[dim.d] = split;
+          continue;
+        }
+        auto it = planned.find(dim.region);
+        if (it != planned.end()) {
+          given[dim.d] = it->second;
+          continue;
+        }
+        given[dim.d] = dim.extent;
+        if (first_unshared) {
+          first_unshared = false;
+          size_t pure_j = 0;
+          while (pure[pure_j].d != dim.d) ++pure_j;
+          if (std::optional<slinky::index_t> local =
+                  footprint_tile(pure, pure_j)) {
+            given[dim.d] = make_tile_step(*local, dim.extent);
+          }
+        }
+      }
+      mp.given_splits = std::move(given);
+    }
+  }
+}
+
 }  // namespace
 
 // Logically this function has multiple separate blocks:
@@ -499,10 +765,17 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
 //    func-s. This is done in a separate loop once all of the functions from
 //    the pipeline were processed.
 void ynn_runtime::schedule() {
-  // Compute the steps of the declared (not given) splits. Functions declare
-  // their scheduling inputs at create time (see schedule_params); the steps
-  // are computed here, in creation order, so the computation can later use
-  // global (cross-function) context.
+  // Maps {buffer_sym, dim_index} to its inferred source region unique
+  // identifier.
+  std::map<std::pair<slinky::var, int>, int> source_regions =
+      infer_source_regions(funcs);
+
+  // Rewrite the declarations of reduction-rooted fused chains so their
+  // members declare consistent steps, then compute the steps of the
+  // declared (not given) splits. Functions declare their scheduling inputs
+  // at create time (see schedule_params); the steps are computed here, in
+  // creation order.
+  reconcile_chains(globals, funcs, source_regions);
   for (slinky::func& f : funcs) {
     auto* sched = static_cast<ynn::scheduling_info*>(f.user_data());
     if (sched && !sched->params.dims.empty()) {
@@ -518,11 +791,6 @@ void ynn_runtime::schedule() {
   std::vector<loop_level> global_loop_nest;
 
   std::vector<scheduling_data> func_scheduling_data(funcs.size());
-
-  // Maps {buffer_sym, dim_index} to its inferred source region unique
-  // identifier.
-  std::map<std::pair<slinky::var, int>, int> source_regions =
-      infer_source_regions(funcs);
 
   auto get_source_region = [&](slinky::var buf, int dim) {
     auto key = std::make_pair(buf, dim);
