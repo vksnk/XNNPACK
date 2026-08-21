@@ -609,9 +609,52 @@ void ynn_runtime::schedule() {
               // splits across it either.
               break;
             }
+            // EXPERIMENT (YNN_SYMB=1): drop the constant-step restriction.
+            // An out-of-order required match is sound for any step: it
+            // overrides a non-required loop step like an in-order match
+            // would, and reconciles with a required one via lcm below. What
+            // it must not do is reorder this function's own required splits
+            // against each other - that undoes a deliberate blocking choice
+            // (the dot loops over n outside of m so B streams once per n
+            // block and its pack, which has no m dimension, fuses under the
+            // n loop; matching m past the unmatched n restreams B per m
+            // step and evicts the pack to root, measured 2x slower on
+            // dynamic mixed-dot pipelines). The inversion is harmless when
+            // the reduction extent is provably small: the restreamed rows
+            // fit in cache regardless of order (e.g. attention's QK dot,
+            // whose reduction is the constant head size; measured -40% at
+            // seq >= 512).
+            static const bool symb_override = [] {
+              const char* env = getenv("YNN_SYMB");
+              return env && atoi(env) != 0;
+            }();
+            auto keeps_required_order = [&]() {
+              for (int prev = 0; prev < split_i; ++prev) {
+                if (!split_matched[prev] &&
+                    loop_splits[prev].step_is_required) {
+                  return false;
+                }
+              }
+              return true;
+            };
+            auto small_reduction = [&]() {
+              slinky::index_t k_product = 1;
+              for (const auto& out : f.outputs()) {
+                for (int d = 0; d < static_cast<int>(out.dims.size()); ++d) {
+                  if (globals.is_pure_dim(out.dims[d])) continue;
+                  auto c = slinky::as_constant(
+                      slinky::simplify(out.buffer->dim(d).bounds.extent()));
+                  if (!c) return false;
+                  k_product *= *c;
+                }
+              }
+              return k_product <= 256;
+            };
             if (split.step_is_required && out_of_order &&
-                !(!global_loop.step_is_required &&
-                  slinky::as_constant(split.step)) &&
+                !((symb_override ||
+                   (!global_loop.step_is_required &&
+                    slinky::as_constant(split.step))) &&
+                  (keeps_required_order() || small_reduction())) &&
                 !(global_loop.step.defined() &&
                   slinky::prove_true(split.step == global_loop.step))) {
               // A required step matched out of order imposes the function's
