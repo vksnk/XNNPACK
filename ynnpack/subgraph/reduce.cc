@@ -541,6 +541,25 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       for (size_t d = 0; d < all_dims.size(); ++d) {
         if (runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
       }
+      // The splits above were computed with the positional handout, where
+      // the pure dimensions claim the tile area first; a reduction dimension
+      // can be left with a split of 1, which the reorder then makes an
+      // innermost serial loop invoking the fused body per single reduction
+      // element. Raise such splits to pairs, halving that overhead at the
+      // price of doubling the fused tile. Only provably-1 splits are raised
+      // (never lower or wrap a computed split): larger floors help some
+      // shapes but overshoot the budget of fused chains whose other
+      // reduction steps were computed above 1 (blockwise m=256 regressed
+      // 7-27% at floors of 4-8 via its colsum's step of 2).
+      for (size_t d = 0; d < all_dims.size(); ++d) {
+        if (runtime.globals.is_pure_dim(all_dims[d])) continue;
+        if (d < split_factors.size()) continue;
+        if (!phys_extents[d].defined() || !splits[d].defined()) continue;
+        if (slinky::is_constant(splits[d], 1)) {
+          splits[d] = slinky::simplify(
+              slinky::min(2, slinky::max(phys_extents[d], 1)));
+        }
+      }
       sched = runtime.make_schedule(all_dims, phys_extents, splits, order);
     } else {
       sched = runtime.make_schedule(all_dims, phys_extents,
