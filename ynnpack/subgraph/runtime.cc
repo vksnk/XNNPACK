@@ -610,17 +610,22 @@ void ynn_runtime::schedule() {
               break;
             }
             if (split.step_is_required && out_of_order &&
+                !(!global_loop.step_is_required &&
+                  slinky::as_constant(split.step)) &&
                 !(global_loop.step.defined() &&
                   slinky::prove_true(split.step == global_loop.step))) {
-              // A required step means the function deliberately chose the
-              // blocking of this loop, and the loop order is likely a part of
-              // the same deliberate choice. Matching it out of order would
-              // impose that blocking on a nest built for a different order
-              // (e.g. pull a dot under the loops of its elementwise consumer,
-              // overriding the consumer's steps with the dot's tiles), so we
-              // only allow such splits to be matched in their declared order —
-              // unless the loop's step is provably already the required step,
-              // in which case the match imposes nothing on the nest.
+              // A required step matched out of order imposes the function's
+              // deliberately chosen blocking on a loop of a nest built for a
+              // different order. That is fine when the step is a known
+              // constant and the loop's own step is not required - the
+              // override retiles the loop exactly like an in-order required
+              // match would (and lets e.g. a dot retile the loops seeded by
+              // its consumers' default splits). A symbolic step is not worth
+              // imposing: it cannot be reasoned about downstream, and
+              // overriding a loop with one measured 2x slower on dynamic
+              // mixed-dot pipelines. Everything else must match in the
+              // declared order - unless the loop's step is provably already
+              // the required step, in which case the match imposes nothing.
               continue;
             }
             // Map the producer's loop variable back to its output dimension

@@ -514,9 +514,38 @@ void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
       attrs.allow_in_place = (1 << 1);
     }
 
-    auto sched =
-        runtime.make_schedule(all_dims, input_a.physical_extents(),
-                              input_a.buffer->elem_size(), split_factors);
+    // Schedule the computed reduction loops innermost. A reduction loop is
+    // always serial, so leaving it outside the (parallel) pure loops joins
+    // the thread pool on every step; it is also a matching fence, so an
+    // early reduction loop blocks the pure loops behind it from fusing. The
+    // splits keep their positional computation (a partial reduction's given
+    // pr_split loops are pure and stay as declared).
+    std::vector<slinky::expr> phys_extents = input_a.physical_extents();
+    std::unique_ptr<ynn::scheduling_info> sched;
+    bool computed_reduction = false;
+    for (size_t d = split_factors.size(); d < all_dims.size(); ++d) {
+      if (phys_extents[d].defined() &&
+          !runtime.globals.is_pure_dim(all_dims[d])) {
+        computed_reduction = true;
+      }
+    }
+    if (computed_reduction) {
+      std::vector<slinky::expr> splits =
+          make_split_factors(runtime.globals, phys_extents,
+                             input_a.buffer->elem_size(), split_factors);
+      std::vector<int> order;
+      order.reserve(all_dims.size());
+      for (size_t d = 0; d < all_dims.size(); ++d) {
+        if (!runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
+      }
+      for (size_t d = 0; d < all_dims.size(); ++d) {
+        if (runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
+      }
+      sched = runtime.make_schedule(all_dims, phys_extents, splits, order);
+    } else {
+      sched = runtime.make_schedule(all_dims, phys_extents,
+                                    input_a.buffer->elem_size(), split_factors);
+    }
 
     auto func = slinky::func::make(
         make_unary_reduce_impl(op, kernel),
