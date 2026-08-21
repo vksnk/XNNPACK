@@ -1,0 +1,41 @@
+  // Group reduction steps: each iteration of a reduction loop re-reads and
+  // re-writes the whole accumulator tile, which has usually been evicted by
+  // the other output tiles visited in between, and when the serial reduction
+  // loop has parallel loops inside, every iteration also joins the thread
+  // pool. Grouping divides both fixed costs by the group size at the price
+  // of exceeding the tile area budget by the same factor. The join cost
+  // scales with the thread count while the cache overshoot doesn't, so the
+  // sweet spot moves with threads. Measured on the fused blockwise dot
+  // (m=256/n=4096/k=4096 bs=32, 9900X, ms):
+  //            1 thread   4 threads   8 threads
+  //   group=1    22.9        -           9.8
+  //   group=2    19.4        6.5         6.3
+  //   group=4    20.0        5.7         4.5
+  //   group=8    22.5        8.7         5.6
+  // Only computed (not given) splits of reduction dimensions are raised, and
+  // only when provably 1: wrapping an already whole-extent symbolic split in
+  // max() changed the step into an expression the loop rewriter couldn't
+  // reason about and produced overlapping reduction crops (double-counted
+  // elements). A provably-1 split is also the only case the grouping can
+  // help. Dimensions with a declared step granularity (packed sub-byte
+  // storage) are left alone: their step granularity is a storage byte.
+  const int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
+  const slinky::index_t group = max_threads > 1 ? 4 : 2;
+  for (int d = 0; d < rank; ++d) {
+    if (globals.is_pure_dim(params.dims[d])) continue;
+    if (d < params.given_splits.size()) continue;
+    if (d < params.step_granularities.size() &&
+        params.step_granularities[d] != 1) {
+      continue;
+    }
+    if (d >= params.extents.size() || !params.extents[d].defined() ||
+        !splits[d].defined()) {
+      continue;
+    }
+    if (!slinky::is_constant(splits[d], 1)) continue;
+    // min(group, max(extent, 1)) never exceeds the extent and stays at least
+    // 1 for empty runtime extents (a step of 0 would never terminate).
+    splits[d] = slinky::simplify(
+        slinky::min(group, slinky::max(params.extents[d], 1)));
+  }
+

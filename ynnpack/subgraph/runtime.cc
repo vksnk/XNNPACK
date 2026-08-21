@@ -78,6 +78,19 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     // Nothing to schedule here.
     return {};
   }
+  params.dims.assign(dims.begin(), dims.end());
+
+  // The loop splits are built and their steps computed by schedule() (see
+  // compute_declared_steps), which runs before matching and can use global
+  // (cross-function) context to adjust the declaration first.
+  auto sched = std::make_unique<ynn::scheduling_info>();
+  sched->params = std::move(params);
+  return sched;
+}
+
+void ynn_runtime::compute_declared_steps(ynn::scheduling_info& sched) {
+  ynn::schedule_params& params = sched.params;
+  const int rank = params.dims.size();
 
   std::vector<slinky::expr> splits =
       make_split_factors(globals, params.extents, params.element_cost,
@@ -93,7 +106,7 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     bool any_computed_reduction = false;
     for (int d = static_cast<int>(params.given_splits.size()); d < rank; ++d) {
       if (d < static_cast<int>(params.extents.size()) &&
-          params.extents[d].defined() && !globals.is_pure_dim(dims[d])) {
+          params.extents[d].defined() && !globals.is_pure_dim(params.dims[d])) {
         any_computed_reduction = true;
       }
     }
@@ -101,10 +114,10 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
       std::vector<int> order;
       order.reserve(rank);
       for (int d = 0; d < rank; ++d) {
-        if (!globals.is_pure_dim(dims[d])) order.push_back(d);
+        if (!globals.is_pure_dim(params.dims[d])) order.push_back(d);
       }
       for (int d = 0; d < rank; ++d) {
-        if (globals.is_pure_dim(dims[d])) order.push_back(d);
+        if (globals.is_pure_dim(params.dims[d])) order.push_back(d);
       }
       params.loop_order = std::move(order);
       // The splits above were computed with the positional handout, where
@@ -118,7 +131,7 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
       // reduction steps were computed above 1 (blockwise m=256 regressed
       // 7-27% at floors of 4-8 via its colsum's step of 2).
       for (int d = 0; d < rank; ++d) {
-        if (globals.is_pure_dim(dims[d])) continue;
+        if (globals.is_pure_dim(params.dims[d])) continue;
         if (d < static_cast<int>(params.given_splits.size())) continue;
         if (d >= static_cast<int>(params.extents.size()) ||
             !params.extents[d].defined() || !splits[d].defined()) {
@@ -132,37 +145,25 @@ std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
     }
   }
 
-  auto sched = make_schedule(dims, params.extents, splits, params.loop_order);
-  if (sched) {
-    sched->params = std::move(params);
-  }
-  return sched;
-}
-
-std::unique_ptr<ynn::scheduling_info> ynn_runtime::make_schedule(
-    ynn::span<const slinky::var> dims, ynn::span<const slinky::expr> extents,
-    ynn::span<const slinky::expr> splits, ynn::span<const int> loop_order) {
-  const int rank = dims.size();
-  if (rank <= 0) {
-    // Nothing to schedule here.
-    return {};
-  }
-
+  // Build the loop splits in the declared loop order. A given split that is
+  // undefined means "no loop for this dimension".
   auto get_loop_dim = [&](int index_d) {
-    return index_d < loop_order.size() ? loop_order[index_d] : index_d;
+    return index_d < params.loop_order.size() ? params.loop_order[index_d]
+                                              : index_d;
   };
-
   std::vector<ynn::scheduling_split> loop_splits;
   for (int index_d = 0; index_d < rank; ++index_d) {
     int d = get_loop_dim(index_d);
-    if (extents[d].defined() && splits[d].defined()) {
-      loop_splits.push_back({dims[d], splits[d], extents[d]});
+    if (d >= params.extents.size() || !params.extents[d].defined()) continue;
+    if (d < params.given_splits.size() && !params.given_splits[d].defined()) {
+      continue;
     }
+    const bool required =
+        d < params.step_required.size() && params.step_required[d];
+    loop_splits.push_back(
+        {params.dims[d], splits[d], params.extents[d], required});
   }
-
-  auto scheduling_info = std::make_unique<ynn::scheduling_info>();
-  scheduling_info->loop_splits = std::move(loop_splits);
-  return scheduling_info;
+  sched.loop_splits = std::move(loop_splits);
 }
 
 namespace {
@@ -525,6 +526,23 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
 //    func-s. This is done in a separate loop once all of the functions from
 //    the pipeline were processed.
 void ynn_runtime::schedule() {
+  // Maps {buffer_sym, dim_index} to its inferred source region unique
+  // identifier.
+  std::map<std::pair<slinky::var, int>, int> source_regions =
+      infer_source_regions(funcs);
+
+  // Rewrite the declarations of reduction-rooted fused chains so their
+  // members declare consistent steps, then compute the steps of the
+  // declared (not given) splits. Functions declare their scheduling inputs
+  // at create time (see schedule_params); the steps are computed here, in
+  // creation order.
+  for (slinky::func& f : funcs) {
+    auto* sched = static_cast<ynn::scheduling_info*>(f.user_data());
+    if (sched && !sched->params.dims.empty()) {
+      compute_declared_steps(*sched);
+    }
+  }
+
   // This a list of indices of consumers of a given buffer.
   std::map<slinky::var, std::vector<int>> consumers;
   // This is a tree representing a global loop nest of a whole pipeline so
@@ -533,11 +551,6 @@ void ynn_runtime::schedule() {
   std::vector<loop_level> global_loop_nest;
 
   std::vector<scheduling_data> func_scheduling_data(funcs.size());
-
-  // Maps {buffer_sym, dim_index} to its inferred source region unique
-  // identifier.
-  std::map<std::pair<slinky::var, int>, int> source_regions =
-      infer_source_regions(funcs);
 
   auto get_source_region = [&](slinky::var buf, int dim) {
     auto key = std::make_pair(buf, dim);
