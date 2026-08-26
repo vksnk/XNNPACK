@@ -390,6 +390,104 @@ std::string tuner_func_name(const ynn::slinky_globals& globals,
   return "?";
 }
 
+// A guaranteed constant lower bound on the number of iterations of a loop
+// with the given extent and step, or 1 when either bound is unknown (a
+// scheduled loop runs at least one iteration). Steps are often global let
+// variables whose values reference the opaque dot split factors, so both are
+// run through bounds_of with the registered facts before asking for a
+// constant bound.
+slinky::index_t iterations_lower_bound(ynn::slinky_globals& globals,
+                                       const slinky::expr& extent,
+                                       const slinky::expr& step) {
+  std::optional<slinky::index_t> extent_lb =
+      slinky::evaluate_constant_lower_bound(
+          slinky::bounds_of(extent, globals.fact_bounds, globals.fact_alignment)
+              .min);
+  std::optional<slinky::index_t> step_ub =
+      slinky::evaluate_constant_upper_bound(
+          slinky::bounds_of(resolve_let_var(globals, step), globals.fact_bounds,
+                            globals.fact_alignment)
+              .max);
+  if (extent_lb && step_ub && *step_ub > 0) {
+    return std::max<slinky::index_t>(slinky::ceil_div(*extent_lb, *step_ub), 1);
+  }
+  return 1;
+}
+
+// A guaranteed lower bound on the number of parallel tasks the given levels
+// of the loop nest produce: the product of each pure loop's provable
+// iteration count. Reduction loops run their iterations within one task, so
+// they contribute nothing.
+slinky::index_t nest_tasks_lower_bound(ynn::slinky_globals& globals,
+                                       std::vector<loop_level>& nest,
+                                       const std::vector<int>& levels) {
+  slinky::index_t tasks = 1;
+  for (int i : levels) {
+    const loop_level& l = nest[i];
+    if (!globals.is_pure_dim(l.loop_id.var)) continue;
+    tasks = slinky::mul_sat(tasks,
+                            iterations_lower_bound(globals, l.extent, l.step));
+  }
+  return tasks;
+}
+
+// The same lower bound for the loops a function would run itself if computed
+// at root.
+slinky::index_t split_tasks_lower_bound(
+    ynn::slinky_globals& globals,
+    const std::vector<ynn::scheduling_split>& splits) {
+  slinky::index_t tasks = 1;
+  for (const ynn::scheduling_split& s : splits) {
+    if (!globals.is_pure_dim(s.var)) continue;
+    tasks = slinky::mul_sat(tasks,
+                            iterations_lower_bound(globals, s.extent, s.step));
+  }
+  return tasks;
+}
+
+// A provable constant upper bound of the bytes of `f`'s first output, i.e.
+// what computing `f` at root would materialize. The extents come from the
+// function's declared splits (which span its iteration space); the buffer's
+// own dim bounds are frequently behind expressions the constant evaluator
+// can't resolve. nullopt when any extent has no constant bound (e.g. dynamic
+// shapes).
+std::optional<slinky::index_t> output_bytes_upper_bound(
+    const slinky::func& f,
+    const std::vector<ynn::scheduling_split>& loop_splits) {
+  if (f.outputs().empty()) return std::nullopt;
+  std::optional<slinky::index_t> elem =
+      slinky::as_constant(f.outputs()[0].buffer->elem_size());
+  if (!elem) return std::nullopt;
+  slinky::index_t total = *elem;
+  for (const ynn::scheduling_split& s : loop_splits) {
+    std::optional<slinky::index_t> ub =
+        slinky::evaluate_constant_upper_bound(s.extent);
+    if (!ub) return std::nullopt;
+    total = slinky::mul_sat(total, std::max<slinky::index_t>(*ub, 1));
+  }
+  return total;
+}
+
+// The un-fuse rule below trades memory for parallelism, so it is capped by
+// roughly the size of a shared last-level cache. Overridable for experiments
+// via YNN_UNFUSE_BUDGET (bytes); YNN_UNFUSE=0 disables the rule entirely.
+bool unfuse_rule_enabled() {
+  static const bool enabled = [] {
+    const char* v = getenv("YNN_UNFUSE");
+    return !v || atoi(v) != 0;
+  }();
+  return enabled;
+}
+
+slinky::index_t unfuse_bytes_budget() {
+  static const slinky::index_t budget = [] {
+    const char* v = getenv("YNN_UNFUSE_BUDGET");
+    return v ? static_cast<slinky::index_t>(atoll(v))
+             : static_cast<slinky::index_t>(24) << 20;
+  }();
+  return budget;
+}
+
 // Decide how many workers each loop of the global nest should use. This must
 // run after the whole nest is built (and all the steps are final): after
 // fusion, a function's loops can end up inside loops of other functions, so
@@ -799,6 +897,15 @@ void ynn_runtime::schedule() {
     tuner->begin_pipeline(key);
   }
 
+  // `thread_count()` reports the number of background worker threads. The
+  // thread that invokes the runtime also participates as a worker (it runs
+  // tasks while waiting in `thread_pool::wait_for`), so the effective
+  // parallelism is one more than the reported count. Without this `+ 1`, a
+  // pool with a single background thread (two threads of execution in total)
+  // would be scheduled serially, and every other size would be sized one
+  // worker short.
+  const int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
+
   // This a list of indices of consumers of a given buffer.
   std::map<slinky::var, std::vector<int>> consumers;
   // This is a tree representing a global loop nest of a whole pipeline so
@@ -930,14 +1037,85 @@ void ynn_runtime::schedule() {
       // which doesn't slice its output would recompute the function on every
       // iteration of that loop.
       //
-      // Autotuner decision: cap how deep this function fuses. The default
-      // (and maximum) is as deep as the splits can match; 0 means compute
-      // root.
-      int max_compute_at = static_cast<int>(loop_nest.size());
+      // Un-fuse rule: fusing this function into a consumer nest that cannot
+      // parallelize serializes all of its work. The canonical case is a
+      // blockwise-quantized dot chain rooted at a cross-block reduction: the
+      // reduction loop is serial by construction and the consumer's pure
+      // loops are single cache-sized tiles, so the dot -- the bulk of the
+      // work -- runs on one thread. When this function's own loops provably
+      // supply the parallelism the nest lacks, and materializing its output
+      // is affordable, computing it at root wins: measured 2.4-3x on
+      // blockwise int4/int8 dot chains for medium batch sizes and neutral
+      // elsewhere. Deliberately conservative: it acts only on parallelism
+      // this function's *current* splits prove (per iterations_lower_bound),
+      // so cases where the win requires re-splitting the function finer
+      // (very small batches, where the searched optimum splits the block
+      // dimension below the cache-derived split) are left to the default
+      // schedule for now.
+      int rule_max_compute_at = static_cast<int>(loop_nest.size());
+      if (getenv("YNN_UNFUSE_DEBUG") && !loop_nest.empty()) {
+        std::optional<slinky::index_t> bytes =
+            output_bytes_upper_bound(f, loop_splits);
+        fprintf(stderr,
+                "unfuse? %s nest_tasks=%lld own_tasks=%lld bytes=%lld "
+                "threads=%d nest=%zu\n",
+                tuner_func_name(globals, &f).c_str(),
+                (long long)nest_tasks_lower_bound(globals, global_loop_nest,
+                                                  loop_nest),
+                (long long)split_tasks_lower_bound(globals, loop_splits),
+                bytes ? (long long)*bytes : -1, max_threads, loop_nest.size());
+      }
+      // A function with a required (kernel-blocking) split is excluded: an
+      // out-of-order required match retiles the consumer's loops with the
+      // kernel's own blocking, so fusing it can parallelize the nest that
+      // looks serial before the match (e.g. a dot fusing into its rescale
+      // chain).
+      const bool has_required_split =
+          std::any_of(loop_splits.begin(), loop_splits.end(),
+                      [](const ynn::scheduling_split& s) {
+                        return s.step_is_required;
+                      });
+      // The nest must be provably starved (fewer tasks than threads), and
+      // this function's own parallelism must decisively beat it -- a modest
+      // advantage (e.g. a few-block bs256 chain with 2-8 tasks either way)
+      // does not pay for the materialization.
+      const slinky::index_t nest_tasks =
+          nest_tasks_lower_bound(globals, global_loop_nest, loop_nest);
+      const slinky::index_t own_tasks =
+          split_tasks_lower_bound(globals, loop_splits);
+      if (unfuse_rule_enabled() && max_threads > 1 && !loop_nest.empty() &&
+          !has_required_split && nest_tasks < max_threads &&
+          own_tasks >= 2 * max_threads &&
+          own_tasks >= 16 * nest_tasks) {
+        std::optional<slinky::index_t> bytes =
+            output_bytes_upper_bound(f, loop_splits);
+        if (bytes && *bytes <= unfuse_bytes_budget()) {
+          rule_max_compute_at = 0;
+          // The consumer nest keeps the remaining (reduction) phase; its
+          // single-tile pure loops get a finer proposed step so that phase
+          // can parallelize too. compute_workers adopts a proposal only if
+          // the nest still needs the tasks.
+          for (int i : loop_nest) {
+            loop_level& l = global_loop_nest[i];
+            if (!globals.is_pure_dim(l.loop_id.var) || l.step_is_required ||
+                l.proposed_step.defined() || !l.step.defined()) {
+              continue;
+            }
+            l.proposed_step =
+                align_step(slinky::max(l.step / 4, 1), l.step_alignment);
+          }
+        }
+      }
+
+      // Autotuner decision: cap how deep this function fuses. The default is
+      // the un-fuse rule's answer (usually as deep as the splits can match);
+      // 0 means compute root.
+      int max_compute_at = rule_max_compute_at;
       if (tuner && !loop_nest.empty()) {
         max_compute_at =
             tuner->choose(tuner_func_name(globals, &f) + ".fuse", "fuse",
-                          max_compute_at + 1, max_compute_at);
+                          static_cast<int>(loop_nest.size()) + 1,
+                          rule_max_compute_at);
       }
       compute_at = 0;
       while (compute_at < max_compute_at) {
@@ -1016,14 +1194,6 @@ void ynn_runtime::schedule() {
     }
   }
 
-  // `thread_count()` reports the number of background worker threads. The
-  // thread that invokes the runtime also participates as a worker (it runs
-  // tasks while waiting in `thread_pool::wait_for`), so the effective
-  // parallelism is one more than the reported count. Without this `+ 1`, a
-  // pool with a single background thread (two threads of execution in total)
-  // would be scheduled serially, and every other size would be sized one
-  // worker short.
-  const int max_threads = threadpool() ? threadpool()->thread_count() + 1 : 1;
   // A function executes inside every loop of its (final) loop nest, so the
   // number of functions inside a loop level is the number of loop nests it
   // appears in. A count of 1 means the level only contains the function that
