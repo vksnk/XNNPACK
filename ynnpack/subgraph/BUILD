@@ -85,6 +85,8 @@ cc_library(
         "reduce.cc",
         "reduce.h",
         "runtime.cc",
+        "schedule_tuner.cc",
+        "schedule_tuner.h",
         "slice_like.cc",
         "slinky.cc",
         "stack.cc",

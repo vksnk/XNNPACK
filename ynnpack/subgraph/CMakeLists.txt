@@ -32,6 +32,7 @@ ADD_LIBRARY(ynnpack_subgraph STATIC
   iota.cc
   reduce.cc
   runtime.cc
+  schedule_tuner.cc
   slice_like.cc
   slinky.cc
   stack.cc

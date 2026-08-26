@@ -11,10 +11,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -35,6 +37,7 @@
 #include "ynnpack/base/span.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/schedule_tuner.h"
 #include "ynnpack/subgraph/slinky.h"
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/tensor.h"
@@ -48,6 +51,7 @@
 #include "slinky/runtime/depends_on.h"
 #include "slinky/runtime/evaluate.h"
 #include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
 #include "slinky/runtime/stmt.h"
 
 void ynn_runtime_value::make_buffer(ynn_runtime& runtime,
@@ -375,6 +379,17 @@ slinky::expr align_step(slinky::expr step, slinky::index_t alignment) {
   return ((step + (alignment - 1)) / alignment) * alignment;
 }
 
+// A stable name identifying `f` in autotuner decision keys: the symbol of its
+// first output buffer. Buffer symbols are derived from value ids, so they are
+// stable across rebuilds of the same subgraph.
+std::string tuner_func_name(const ynn::slinky_globals& globals,
+                            const slinky::func* f) {
+  if (f && !f->outputs().empty()) {
+    return globals.symbols.name(f->outputs()[0].sym());
+  }
+  return "?";
+}
+
 // Decide how many workers each loop of the global nest should use. This must
 // run after the whole nest is built (and all the steps are final): after
 // fusion, a function's loops can end up inside loops of other functions, so
@@ -393,9 +408,17 @@ slinky::expr align_step(slinky::expr step, slinky::index_t alignment) {
 void compute_workers(ynn::slinky_globals& globals, int max_threads,
                      std::vector<loop_level>& global_loop_nest,
                      const std::vector<int>& funcs_in_level) {
+  ynn::schedule_tuner* tuner = ynn::schedule_tuner::get();
+
   // Enough tasks to have good load balancing.
-  const slinky::index_t target_task_count =
-      max_threads > 1 ? max_threads * 2 : 1;
+  slinky::index_t target_task_count = max_threads > 1 ? max_threads * 2 : 1;
+  if (tuner && max_threads > 1) {
+    // 0: 2x threads (the default), 1: 1x, 2: 4x, 3: 8x.
+    static constexpr int multipliers[] = {2, 1, 4, 8};
+    target_task_count =
+        max_threads *
+        multipliers[tuner->choose("task_target", "task_target", 4, 0)];
+  }
 
   // A guaranteed lower bound of the number of iterations of loop level `l`:
   // ceil_div(lower bound of extent, upper bound of step), or 1 when either
@@ -449,14 +472,28 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
     // inner levels past the task target and turn them serial. The inner
     // levels are also the better place to split: finer tasks over contiguous
     // memory.
-    if (l.proposed_step.defined() && max_threads > 1 &&
-        !parallel_in_subtree[i] && tasks_above_lb < target_task_count) {
-      // Behind a global so per-task closures reference a variable evaluated
-      // once per invoke, not the whole select tree.
-      l.step = globals.get(
-          slinky::simplify(align_step(l.proposed_step, l.step_alignment),
-                           globals.fact_bounds, globals.fact_alignment),
-          "s");
+    if (l.proposed_step.defined() && max_threads > 1) {
+      bool adopt =
+          !parallel_in_subtree[i] && tasks_above_lb < target_task_count;
+      if (tuner) {
+        // 0: the heuristic above, 1: force adoption, 2: force rejection.
+        switch (tuner->choose(tuner_func_name(globals, l.loop_id.func) + "." +
+                                  globals.symbols.name(l.loop_id.var) +
+                                  ".adopt",
+                              "adopt", 3, 0)) {
+          case 1: adopt = true; break;
+          case 2: adopt = false; break;
+        }
+      }
+      if (adopt) {
+        // Behind a global so per-task closures reference a variable evaluated
+        // once per invoke, not the whole select tree.
+        l.step = globals.get(
+            slinky::simplify(
+                align_step(l.proposed_step, l.step_alignment),
+                globals.fact_bounds, globals.fact_alignment),
+            "s");
+      }
     }
     // A loop that provably runs exactly one iteration is identical for any
     // number of functions inside it (required steps are excluded). Replacing
@@ -742,6 +779,26 @@ void reconcile_step(ynn::slinky_globals& globals, loop_level& loop,
 //    func-s. This is done in a separate loop once all of the functions from
 //    the pipeline were processed.
 void ynn_runtime::schedule() {
+  // When the autotuner is active, identify this pipeline by a hash of its
+  // structure (buffer symbols and split counts), so recorded decisions can be
+  // replayed against rebuilds of the same pipeline.
+  ynn::schedule_tuner* tuner = ynn::schedule_tuner::get();
+  if (tuner) {
+    uint64_t key = 0xcbf29ce484222325ULL;
+    auto mix = [&key](uint64_t v) { key = (key ^ v) * 0x100000001b3ULL; };
+    for (const slinky::func& f : funcs) {
+      for (const auto& out : f.outputs()) {
+        for (char c : globals.symbols.name(out.sym())) {
+          mix(static_cast<uint8_t>(c));
+        }
+      }
+      const auto* sched =
+          static_cast<const ynn::scheduling_info*>(f.user_data());
+      mix(sched ? sched->loop_splits.size() + 1 : 0);
+    }
+    tuner->begin_pipeline(key);
+  }
+
   // This a list of indices of consumers of a given buffer.
   std::map<slinky::var, std::vector<int>> consumers;
   // This is a tree representing a global loop nest of a whole pipeline so
@@ -814,6 +871,39 @@ void ynn_runtime::schedule() {
     // just compute at the innermost location.
     if (sched && !sched->loop_splits.empty()) {
       std::vector<ynn::scheduling_split>& loop_splits = sched->loop_splits;
+
+      // Autotuner decision: scale this function's split steps. Only pure
+      // dims: a reduction ("k") loop's step controls accumulation blocking,
+      // and a partial reduction ("r") loop's step is coupled to the reduction
+      // buffer's fold_factor. A required step is a kernel blocking, so only
+      // integer multiples keep the alignment guarantees derived from it;
+      // other steps are cache splits that can scale both ways.
+      if (tuner) {
+        const std::string fkey = tuner_func_name(globals, &f);
+        for (ynn::scheduling_split& split : loop_splits) {
+          if (!globals.is_pure_dim(split.var) || !split.step.defined()) {
+            continue;
+          }
+          const std::string key =
+              fkey + "." + globals.symbols.name(split.var) + ".scale";
+          if (split.step_is_required) {
+            // 0: x1, 1: x2, 2: x4.
+            static constexpr int multipliers[] = {1, 2, 4};
+            int m = multipliers[tuner->choose(key, "req_scale", 3, 0)];
+            if (m != 1) split.step = split.step * m;
+          } else {
+            // 0: x1, 1: x2, 2: x4, 3: /2, 4: /4.
+            switch (tuner->choose(key, "scale", 5, 0)) {
+              case 1: split.step = split.step * 2; break;
+              case 2: split.step = split.step * 4; break;
+              case 3: split.step = slinky::max(split.step / 2, 1); break;
+              case 4: split.step = slinky::max(split.step / 4, 1); break;
+            }
+            split.step = align_step(split.step, split.step_alignment);
+          }
+        }
+      }
+
       // Make sure that extents of the dims belonging to subnest match.
       // Reverse to simplify indexing below.
       std::reverse(loop_splits.begin(), loop_splits.end());
@@ -839,8 +929,18 @@ void ynn_runtime::schedule() {
       // loop of the nest we can't cover: computing the function inside a loop
       // which doesn't slice its output would recompute the function on every
       // iteration of that loop.
+      //
+      // Autotuner decision: cap how deep this function fuses. The default
+      // (and maximum) is as deep as the splits can match; 0 means compute
+      // root.
+      int max_compute_at = static_cast<int>(loop_nest.size());
+      if (tuner && !loop_nest.empty()) {
+        max_compute_at =
+            tuner->choose(tuner_func_name(globals, &f) + ".fuse", "fuse",
+                          max_compute_at + 1, max_compute_at);
+      }
       compute_at = 0;
-      while (compute_at < loop_nest.size()) {
+      while (compute_at < max_compute_at) {
         loop_level& global_loop = global_loop_nest[loop_nest[compute_at]];
         // Map the consumer's loop variable back to its output dimension
         // index.
@@ -995,6 +1095,10 @@ void ynn_runtime::schedule() {
 
       f.loops(std::move(loops));
     }
+  }
+
+  if (tuner) {
+    tuner->end_pipeline();
   }
 }
 
@@ -1265,6 +1369,17 @@ ynn_status ynn_runtime::build() {
 
   pipeline = slinky::build_pipeline(globals.symbols, {}, inputs, outputs,
                                     globals.lets, options);
+
+  if (const char* ir_path = getenv("YNN_SCHED_IR")) {
+    // Appends each built pipeline, so a process that builds several dumps all
+    // of them; the autotuner hashes the file to recognize schedules it has
+    // already benchmarked.
+    static std::mutex ir_mutex;
+    std::lock_guard<std::mutex> lock(ir_mutex);
+    static std::ofstream ir_file(ir_path);
+    slinky::print(ir_file, pipeline.body, &globals.symbols);
+    ir_file.flush();
+  }
 
   slinky::call_stmt::attributes attrs;
   attrs.name = "ynn_reshape_runtime";
