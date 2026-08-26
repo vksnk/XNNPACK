@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "include/experimental.h"
 #include "include/xnnpack.h"
@@ -17,6 +18,20 @@
 #include "ynnpack/xnnpack/xnnpack.h"
 
 namespace {
+
+// XNNPACK external tensors can be reshaped at runtime
+// (xnn_reshape_external_value), so their creation-time dims cannot normally
+// be used as static graph shapes. Setting YNN_XNNPACK_STATIC_SHAPES=1
+// promises the caller never reshapes an external value, letting the dims
+// become static shapes: extents fold to constants, which unlocks
+// shape-dependent scheduling (e.g. the un-fuse rule) and simplification.
+bool assume_static_shapes() {
+  static const bool enabled = [] {
+    const char* v = getenv("YNN_XNNPACK_STATIC_SHAPES");
+    return v && atoi(v) != 0;
+  }();
+  return enabled;
+}
 
 uint32_t value_flags_from_xnn(uint32_t flags, bool is_static) {
   uint32_t ynn = 0;
@@ -44,7 +59,8 @@ xnn_status xnn_define_tensor_value(xnn_subgraph_t subgraph,
       external_id == XNN_INVALID_VALUE_ID ? YNN_INVALID_VALUE_ID : external_id;
   // YNNPACK interprets non-null dims for non-constant values to be static
   // shapes, so we can't pass them here unless the shape really is static.
-  const size_t* xnn_dims = data ? dims : nullptr;
+  const size_t* xnn_dims =
+      (data || assume_static_shapes()) ? dims : nullptr;
   ynn_status status = ynn_define_tensor(
       subgraph->ynn, ynn::type_from_xnn(datatype), num_dims, xnn_dims, data,
       value_flags_from_xnn(flags, data != nullptr), id_out);
@@ -91,7 +107,8 @@ xnn_status xnn_define_quantized_tensor_value(
       external_id == XNN_INVALID_VALUE_ID ? YNN_INVALID_VALUE_ID : external_id;
   // YNNPACK interprets non-null dims for non-constant values to be static
   // shapes, so we can't pass them here unless the shape really is static.
-  const size_t* xnn_dims = data ? dims : nullptr;
+  const size_t* xnn_dims =
+      (data || assume_static_shapes()) ? dims : nullptr;
   ynn_status status = ynn_define_tensor(
       subgraph->ynn, ynn::type_from_xnn(datatype), num_dims, xnn_dims, data,
       value_flags_from_xnn(flags, data != nullptr), id_out);
