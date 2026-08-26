@@ -216,8 +216,33 @@ ynn_status create_unary(const ynn_node& node, ynn_runtime& runtime,
       make_unary_elementwise_impl(kernel, params, a.type, x.type),
       {{a.buffer, std::move(bounds)}}, {{x.buffer, dims}}, std::move(attrs));
 
-  auto sched = runtime.make_schedule(
-      dims, x.physical_extents(), x.buffer->elem_size());
+  std::unique_ptr<ynn::scheduling_info> sched;
+  const int a_elem_count = type_element_count(a.type);
+  const int x_elem_count = type_element_count(x.type);
+  if (a_elem_count > x_elem_count && !dims.empty()) {
+    // The kernel reads the input in whole groups of a_elem_count/x_elem_count
+    // elements (e.g. int4 -> int8 reads whole input bytes) with no way to
+    // start mid-group, so any split of the output's innermost dimension must
+    // be a multiple of the group size or tiles after the first read out of
+    // phase.
+    const int align = a_elem_count / x_elem_count;
+    std::vector<slinky::expr> phys_extents = x.physical_extents();
+    std::vector<slinky::expr> alignments(phys_extents.size());
+    // make_split_factors requires alignments clamped to the extent.
+    alignments[0] = slinky::min(phys_extents[0], align);
+    std::vector<slinky::expr> splits =
+        ynn::make_split_factors(runtime.globals, phys_extents,
+                                x.buffer->elem_size(), {}, {}, alignments);
+    sched = runtime.make_schedule(dims, phys_extents, splits, {});
+    if (sched) {
+      for (ynn::scheduling_split& split : sched->loop_splits) {
+        if (split.var == dims[0]) split.step_alignment = align;
+      }
+    }
+  } else {
+    sched = runtime.make_schedule(dims, x.physical_extents(),
+                                  x.buffer->elem_size());
+  }
 
   func.user_data() = sched.get();
   runtime.scheduling_info_storage.push_back(std::move(sched));
