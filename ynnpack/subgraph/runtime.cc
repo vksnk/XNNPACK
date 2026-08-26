@@ -122,6 +122,9 @@ struct loop_level {
   slinky::expr extent;
   slinky::expr step;
   bool step_is_required = false;
+  // Any step installed on this loop must be a multiple of this value, see
+  // scheduling_split::step_alignment.
+  slinky::index_t step_alignment = 1;
   // The index of the parent loop in the global loop nest, or -1 for the
   // outermost loops. Loops are appended after their parent, so the parent
   // index is always less than the index of the loop itself.
@@ -366,6 +369,12 @@ slinky::expr is_single_iteration(const ynn::slinky_globals& globals,
   return slinky::simplify(l.extent) <= resolve_let_var(globals, l.step);
 }
 
+// Round `step` up to a multiple of `alignment`.
+slinky::expr align_step(slinky::expr step, slinky::index_t alignment) {
+  if (alignment <= 1 || !step.defined()) return step;
+  return ((step + (alignment - 1)) / alignment) * alignment;
+}
+
 // Decide how many workers each loop of the global nest should use. This must
 // run after the whole nest is built (and all the steps are final): after
 // fusion, a function's loops can end up inside loops of other functions, so
@@ -444,10 +453,10 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
         !parallel_in_subtree[i] && tasks_above_lb < target_task_count) {
       // Behind a global so per-task closures reference a variable evaluated
       // once per invoke, not the whole select tree.
-      l.step =
-          globals.get(slinky::simplify(l.proposed_step, globals.fact_bounds,
-                                       globals.fact_alignment),
-                      "s");
+      l.step = globals.get(
+          slinky::simplify(align_step(l.proposed_step, l.step_alignment),
+                           globals.fact_bounds, globals.fact_alignment),
+          "s");
     }
     // A loop that provably runs exactly one iteration is identical for any
     // number of functions inside it (required steps are excluded). Replacing
@@ -620,22 +629,51 @@ int find_matching_split(ynn::slinky_globals& globals, const slinky::func& f,
 void reconcile_step(ynn::slinky_globals& globals, loop_level& loop,
                     const ynn::scheduling_split& split,
                     const std::vector<ynn::scheduling_split>& loop_splits) {
+  // A function whose kernel needs aligned crops (see step_alignment) imposes
+  // that alignment on the shared loop: whatever step the reconciliation below
+  // ends up with, it must be a multiple of the alignment. Multiplying an
+  // unaligned step by the alignment keeps it an integer number of the
+  // original tiles (like the lcm rule for two required steps), so it stays
+  // valid for every function already in the loop. The alignment is also
+  // remembered on the loop so steps installed later (a proposed step adopted
+  // by compute_workers) respect it too.
+  loop.step_alignment = std::max(loop.step_alignment, split.step_alignment);
+  auto aligned = [&](slinky::expr step) {
+    const slinky::index_t a = loop.step_alignment;
+    if (a > 1 && step.defined()) {
+      step = slinky::simplify(slinky::select(step % a == 0, step, step * a),
+                              globals.fact_bounds, globals.fact_alignment);
+    }
+    return step;
+  };
+  // Align the loop's existing step up front, so every reconciliation outcome
+  // below (including keeping the step as is) leaves the loop aligned. A
+  // pr_split-variable step is left alone: rewriting it here would desync the
+  // partial reduction bounds pinned to that variable, and a partial
+  // reduction's loop cannot match an alignment-carrying split anyway.
+  if (loop.step_alignment > 1) {
+    std::optional<slinky::var> v = slinky::as_variable(loop.step);
+    if (!(v && globals.symbols.name(*v).rfind("pr_split", 0) == 0)) {
+      loop.step = aligned(loop.step);
+    }
+  }
   if (split.step_is_required) {
     if (loop.step_is_required &&
         !prove_true(split.step == loop.step, globals.fact_bounds,
                     globals.fact_alignment)) {
       // If the LCM overflows, it clamps at max index_t (assuming no
       // splitting).
-      loop.step = lcm_sat(globals, loop.step, split.step);
+      loop.step = aligned(lcm_sat(globals, loop.step, split.step));
     } else {
+      const slinky::expr new_step = aligned(split.step);
       if (std::optional<slinky::var> v = slinky::as_variable(loop.step)) {
         // This is a special variable which defines partial reduction bounds,
         // so we need to override to match the loop step.
         if (globals.symbols.name(*v).rfind("pr_split", 0) == 0) {
-          globals.update_let(*v, split.step);
+          globals.update_let(*v, new_step);
         }
       }
-      loop.step = split.step;
+      loop.step = new_step;
     }
     loop.step_is_required = true;
     // A required step is a kernel's blocking, so it outranks any step an
@@ -866,6 +904,7 @@ void ynn_runtime::schedule() {
                                     dim.extent,
                                     dim.step,
                                     dim.step_is_required,
+                                    dim.step_alignment,
                                     parent});
         loop_nest.push_back(global_loop_nest.size() - 1);
       }

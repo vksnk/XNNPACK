@@ -157,6 +157,12 @@ struct scheduling_split {
   // unless the step matches or the other loop doesn't have required step yet.
   // In the latter case this step will override the existing step of that loop.
   bool step_is_required = false;
+  // Any step of this loop must be a multiple of this value. Used by functions
+  // whose kernel consumes its input in groups of elements (e.g. a convert
+  // reading a sub-byte type reads whole bytes): a crop that starts in the
+  // middle of a group would make the kernel read out of phase. The scheduler
+  // must round any step it installs on this loop up to this alignment.
+  slinky::index_t step_alignment = 1;
 };
 
 // A scheduling information for a buffer -- it's expected to be attached to the
