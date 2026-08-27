@@ -126,21 +126,31 @@ def run_benchmark(cmd, choices, space, cpus=None, check=False):
         ir_hash = hashlib.sha256(f.read()).hexdigest()[:16]
     with open(out_json) as f:
       data = json.load(f)
+    # Per-benchmark [real_ns, cpu_ns]. cpu_time is process-wide when the
+    # benchmark uses MeasureProcessCPUTime (the subgraph benches do), so it
+    # catches schedules that win wall time by burning far more total work.
     times = {}
     to_ns = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
     for b in data.get("benchmarks", []):
       scale = to_ns.get(b.get("time_unit", "ns"), 1.0)
+      pair = [b["real_time"] * scale, b.get("cpu_time", 0.0) * scale]
       if b.get("run_type") == "aggregate":
         # Prefer the median aggregate when repetitions are used.
         if b.get("aggregate_name") == "median":
-          times[b["run_name"]] = b["real_time"] * scale
+          times[b["run_name"]] = pair
       else:
-        times.setdefault(b["name"], b["real_time"] * scale)
+        times.setdefault(b["name"], pair)
     return (times, ir_hash), None
 
 
-RESULT_FIELDS = ["signature", "ir_hash", "time_ns", "n_nondefault",
+RESULT_FIELDS = ["signature", "ir_hash", "time_ns", "cpu_ns", "n_nondefault",
                  "times_json", "choices_json"]
+
+
+def load_times(row):
+  """Returns {name: [real_ns, cpu_ns]}, accepting the old scalar format."""
+  times = json.loads(row["times_json"])
+  return {k: v if isinstance(v, list) else [v, 0.0] for k, v in times.items()}
 
 
 def load_results(path):
@@ -175,13 +185,15 @@ def measure(cmd, choices, space, args, results, out_path, label):
   # If an identical schedule was already measured, reuse its time.
   for row in results.values():
     if row["ir_hash"] and row["ir_hash"] == ir_hash:
-      times = json.loads(row["times_json"])
+      times = load_times(row)
       break
-  total = sum(times.values())
+  total = sum(v[0] for v in times.values())
+  total_cpu = sum(v[1] for v in times.values())
   row = {
       "signature": sig,
       "ir_hash": ir_hash,
       "time_ns": f"{total:.1f}",
+      "cpu_ns": f"{total_cpu:.1f}",
       "n_nondefault": n_nondefault,
       "times_json": json.dumps(times),
       "choices_json": json.dumps(
@@ -189,7 +201,8 @@ def measure(cmd, choices, space, args, results, out_path, label):
   }
   append_result(out_path, row, write_header=not results)
   results[sig] = row
-  print(f"  {label}: {total / 1e6:.3f} ms  (ir {ir_hash[:8]})")
+  print(f"  {label}: {total / 1e6:.3f} ms, cpu {total_cpu / 1e6:.3f} ms  "
+        f"(ir {ir_hash[:8]})")
   return row
 
 
@@ -298,21 +311,35 @@ def report(results, baseline):
   if baseline is None:
     defaults = [r for r in rows if r.get("n_nondefault") == "0"]
     baseline = defaults[0] if defaults else None
+  def cpu_of(r):
+    try:
+      return float(r.get("cpu_ns") or 0.0)
+    except ValueError:
+      return 0.0
+
   base_time = float(baseline["time_ns"]) if baseline else float(
       rows[0]["time_ns"])
+  base_cpu = cpu_of(baseline) if baseline else cpu_of(rows[0])
   distinct = len({r["ir_hash"] for r in rows if r["ir_hash"]})
   print(f"\n{len(rows)} samples, {distinct} distinct schedules; "
-        f"baseline {base_time / 1e6:.3f} ms")
+        f"baseline {base_time / 1e6:.3f} ms" +
+        (f", cpu {base_cpu / 1e6:.3f} ms" if base_cpu else ""))
   base_choices = json.loads(baseline["choices_json"]) if baseline else {}
   print("top 10:")
   for r in rows[:10]:
     t = float(r["time_ns"])
+    c = cpu_of(r)
+    # cpu column: total process CPU and its ratio to the baseline's, so a
+    # wall-time win that burns much more total work is visible at a glance.
+    cpu = (f"  cpu {c / 1e6:8.3f} ms ({c / base_cpu:4.2f}x)"
+           if c and base_cpu else "")
     diff = {
         k: v for k, v in json.loads(r["choices_json"]).items()
         if base_choices.get(k) != v
     }
     delta = ", ".join(f"{k.split('/', 1)[-1]}={v}" for k, v in diff.items())
-    print(f"  {t / 1e6:9.3f} ms  {base_time / t:5.2f}x  {delta or '(default)'}")
+    print(f"  {t / 1e6:9.3f} ms  {base_time / t:5.2f}x{cpu}  "
+          f"{delta or '(default)'}")
 
 
 def cmd_stress(args):
