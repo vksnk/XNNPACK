@@ -997,6 +997,41 @@ void ynn_runtime::schedule() {
         }
       }
 
+      // EXPERIMENT (YNN_STEP_CLAMP=1): the cache-tile split heuristic is
+      // thread-blind, so a function with a SINGLE pure dim (e.g. the stat
+      // stages of a layernorm, which keep only the non-reduced axis) gets a
+      // whole-extent step and runs as one task, stranding the other threads.
+      // With one parallel dim there is no tile shape to fragment and no
+      // cross-stage step mismatch to introduce, so clamp its step so the
+      // loop can supply ~2 tasks per thread; the clamp never coarsens, and
+      // multi-dim nests (where materializing via the un-fuse rule is the
+      // right tool) are untouched. Symbolic-safe for dynamic shapes.
+      if (max_threads > 1 && getenv("YNN_STEP_CLAMP")) {
+        int only_pure = -1;
+        int num_pure = 0;
+        for (int j = 0; j < static_cast<int>(loop_splits.size()); ++j) {
+          if (globals.is_pure_dim(loop_splits[j].var)) {
+            only_pure = j;
+            ++num_pure;
+          }
+        }
+        ynn::scheduling_split* s =
+            num_pure == 1 ? &loop_splits[only_pure] : nullptr;
+        std::optional<slinky::var> v =
+            s ? slinky::as_variable(s->step) : std::nullopt;
+        if (s && !s->step_is_required && s->step.defined() &&
+            s->extent.defined() &&
+            !(v && globals.symbols.name(*v).rfind("pr_split", 0) == 0)) {
+          s->step = align_step(
+              slinky::min(s->step,
+                          slinky::max(slinky::ceil_div(
+                                          s->extent,
+                                          slinky::expr(2 * max_threads)),
+                                      1)),
+              s->step_alignment);
+        }
+      }
+
       // Make sure that extents of the dims belonging to subnest match.
       // Reverse to simplify indexing below.
       std::reverse(loop_splits.begin(), loop_splits.end());
