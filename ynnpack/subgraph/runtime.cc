@@ -1083,10 +1083,32 @@ void ynn_runtime::schedule() {
           nest_tasks_lower_bound(globals, global_loop_nest, loop_nest);
       const slinky::index_t own_tasks =
           split_tasks_lower_bound(globals, loop_splits);
+      // The materialized intermediate is written and then re-read by the
+      // consumer; that traffic only streams efficiently if the contiguous
+      // (innermost output) dimension gives reasonably long runs. With tiny
+      // runs the re-read is strided and the materialization costs more than
+      // the parallelism recovers (measured 0.8-0.9x on n=32 x 256-block
+      // chains whose n=128+ twins win 2x).
+      const slinky::index_t contiguous_run_bytes = [&]() -> slinky::index_t {
+        if (f.outputs().empty()) return 0;
+        const auto& out = f.outputs()[0];
+        std::optional<slinky::index_t> elem =
+            slinky::as_constant(out.buffer->elem_size());
+        if (!elem || out.dims.empty()) return 0;
+        for (const ynn::scheduling_split& s : loop_splits) {
+          if (s.var == out.dims[0]) {
+            std::optional<slinky::index_t> ub =
+                slinky::evaluate_constant_upper_bound(s.extent);
+            return ub ? *ub * *elem : 0;
+          }
+        }
+        return 0;
+      }();
       if (unfuse_rule_enabled() && max_threads > 1 && !loop_nest.empty() &&
           !has_required_split && nest_tasks < max_threads &&
           own_tasks >= 2 * max_threads &&
-          own_tasks >= 16 * nest_tasks) {
+          own_tasks >= 16 * nest_tasks &&
+          contiguous_run_bytes >= 512) {
         std::optional<slinky::index_t> bytes =
             output_bytes_upper_bound(f, loop_splits);
         if (bytes && *bytes <= unfuse_bytes_budget()) {
