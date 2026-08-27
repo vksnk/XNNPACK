@@ -1148,6 +1148,11 @@ void ynn_runtime::schedule() {
             row_bytes >= slinky::mul_sat(
                              static_cast<slinky::index_t>(2 * max_threads),
                              root_row_bytes) &&
+            // Firing costs a fixed ~10-15us of sync/wakeup CPU across the
+            // extra phases; at ~16KB of intermediate per thread the recovered
+            // serial work only breaks even on wall time while roughly
+            // doubling CPU (measured), so require strictly more than that.
+            row_bytes > static_cast<slinky::index_t>(16384) * max_threads &&
             contiguous_run_bytes >= 512 &&
             tile_bytes <= unfuse_bytes_budget()) {
           rule_max_compute_at = static_cast<int>(prefix.size());
