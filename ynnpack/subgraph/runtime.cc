@@ -1024,42 +1024,28 @@ void ynn_runtime::schedule() {
       // iteration of that loop.
       //
       // Un-fuse rule. A reduction has a smaller output domain than its
-      // input, so a nest rooted at one is task-starved by construction, and
-      // everything fused into it -- typically the bulk of the work, e.g. the
-      // per-block dots of a blockwise-quantized chain -- serializes with it.
-      // Fusion's only benefit is not materializing the producer's output;
-      // when one tile of that output fits in a shared cache, materializing
-      // it is free, so breaking the fusion costs nothing and recovers the
-      // producer's parallelism. Hence: a pure elementwise producer whose
-      // consumer nest provably cannot reach the task target, and whose
-      // output tile fits the cache budget, is computed outside the nest.
-      // Every gate is provable at build time, for static and dynamic shapes:
-      //  - the nest's guaranteed tasks are below the target (2x threads,
-      //    matching compute_workers);
-      //  - the function is a pure elementwise producer: one with a required
-      //    (kernel-blocking) split retiles the consumer's loops and so
-      //    parallelizes the nest by fusing into it, and one with a
-      //    reduction split of its own is a chain root, not the wide
-      //    intermediate;
-      //  - the contiguous (innermost output) dimension gives runs of at
-      //    least 512 bytes, so the materialized tile streams efficiently
-      //    when re-read;
-      //  - non-constant pure splits (dynamic batch dimensions) form a
-      //    prefix of the consumer loops. The function fuses through exactly
-      //    that prefix, whose loops are pinned to constant steps (a batch
-      //    tile), making the materialized tile constant-sized for any
-      //    runtime batch. With static shapes the prefix is empty and the
-      //    function is computed at root;
-      //  - one tile (constant row bytes x batch tile) fits the budget.
-      // When it fires, the function's own single-iteration constant splits
-      // get real steps and the consumer's remaining single-tile pure loops
-      // get finer proposed steps, so both phases parallelize. Measured 2-3x
-      // on blockwise int4/int8 dot chains across batch sizes, neutral
-      // elsewhere. YNN_UNFUSE=0 disables; YNN_UNFUSE_TILE and
-      // YNN_UNFUSE_BUDGET tune the batch tile and byte budget;
-      // YNN_UNFUSE_DEBUG=1 prints the gate values.
-      const slinky::index_t nest_tasks =
-          nest_tasks_lower_bound(globals, global_loop_nest, loop_nest);
+      // input, so a nest rooted at one can be starved of parallelism, and
+      // everything fused into it (e.g. the per-block dots of a blockwise
+      // quantized chain) serializes with it. Fusion's only benefit is not
+      // materializing the producer's output; when one tile of it is
+      // cache-resident, breaking the fusion is free and recovers the
+      // producer's parallelism. Fire when, provably at build time:
+      //  - f is a pure elementwise producer (required splits retile the
+      //    nest on matching; own reductions make it a chain root);
+      //  - the nest cannot reach one task per thread (starved);
+      //  - f's output exceeds the chain root's by >= 2x threads: this
+      //    reduction factor picks the pre-reduction intermediate and equals
+      //    the parallelism fusion would serialize;
+      //  - rows are >= 512 contiguous bytes (streamable re-read);
+      //  - one tile fits the cache budget, where non-constant (batch) dims
+      //    must be an outer prefix of the nest: f fuses through them and
+      //    they are pinned to constant steps, bounding the tile for any
+      //    runtime batch (empty prefix and compute_root when static).
+      // Then f's whole-extent constant splits get real steps and the
+      // remaining nest loops get finer proposed steps, parallelizing both
+      // phases. Each gate covers a measured regression; see the un-fuse
+      // commits. YNN_UNFUSE=0 disables; YNN_UNFUSE_TILE / YNN_UNFUSE_BUDGET
+      // / YNN_UNFUSE_DEBUG=1 tune and inspect.
       const bool pure_elementwise =
           std::all_of(loop_splits.begin(), loop_splits.end(),
                       [&](const ynn::scheduling_split& s) {
@@ -1070,87 +1056,65 @@ void ynn_runtime::schedule() {
           f.outputs().empty()
               ? std::nullopt
               : slinky::as_constant(f.outputs()[0].buffer->elem_size());
-      const slinky::index_t contiguous_run_bytes = [&]() -> slinky::index_t {
-        if (!elem || f.outputs().empty() || f.outputs()[0].dims.empty()) {
-          return 0;
-        }
-        for (const ynn::scheduling_split& s : loop_splits) {
-          if (s.var == f.outputs()[0].dims[0]) {
-            std::optional<slinky::index_t> ub =
-                slinky::evaluate_constant_upper_bound(s.extent);
-            return ub ? *ub * *elem : 0;
-          }
-        }
-        return 0;
-      }();
-      int rule_max_compute_at = static_cast<int>(loop_nest.size());
-      if (getenv("YNN_UNFUSE_DEBUG") && !loop_nest.empty()) {
-        fprintf(stderr,
-                "unfuse? %s pure=%d nest_tasks=%lld run=%lld nest=%zu\n",
-                tuner_func_name(globals, &f).c_str(), (int)pure_elementwise,
-                (long long)nest_tasks, (long long)contiguous_run_bytes,
-                loop_nest.size());
-      }
-      // The chain root's output row: the reduction's output domain. The
-      // ratio of this function's row to it is the reduction factor -- both
-      // the identifier of the pre-reduction intermediate (consumer-side
-      // elementwise ops have ratio 1) and the amount of parallelism fusion
-      // would serialize.
-      const slinky::index_t root_row_bytes = [&]() -> slinky::index_t {
-        if (loop_nest.empty()) return 0;
-        const slinky::func* root =
-            global_loop_nest[loop_nest.back()].loop_id.func;
-        if (!root || root->outputs().empty()) return 0;
+      // Bytes of one row of a function's output: its element size times the
+      // constant pure extents of its splits.
+      auto row_bytes_of = [&](const slinky::func* fn,
+                              const std::vector<ynn::scheduling_split>& splits)
+          -> slinky::index_t {
+        if (!fn || fn->outputs().empty()) return 0;
         std::optional<slinky::index_t> e =
-            slinky::as_constant(root->outputs()[0].buffer->elem_size());
-        const auto* rs =
-            static_cast<const ynn::scheduling_info*>(root->user_data());
-        if (!e || !rs) return 0;
+            slinky::as_constant(fn->outputs()[0].buffer->elem_size());
+        if (!e) return 0;
         slinky::index_t b = *e;
-        for (const ynn::scheduling_split& s : rs->loop_splits) {
+        for (const ynn::scheduling_split& s : splits) {
           if (!globals.is_pure_dim(s.var)) continue;
           std::optional<slinky::index_t> ub =
               slinky::evaluate_constant_upper_bound(s.extent);
           if (ub) b = slinky::mul_sat(b, std::max<slinky::index_t>(*ub, 1));
         }
         return b;
-      }();
+      };
+      int rule_max_compute_at = static_cast<int>(loop_nest.size());
       if (unfuse_rule_enabled() && max_threads > 1 && !loop_nest.empty() &&
-          pure_elementwise && elem && nest_tasks < max_threads &&
-          contiguous_run_bytes >= 512 && root_row_bytes > 0) {
-        // One output "row": the product of the constant pure extents; the
-        // non-constant (batch) splits must be matchable as a prefix of the
-        // consumer loops.
-        std::vector<bool> is_symbolic(loop_splits.size(), false);
+          pure_elementwise && elem &&
+          nest_tasks_lower_bound(globals, global_loop_nest, loop_nest) <
+              max_threads) {
+        const slinky::index_t row_bytes = row_bytes_of(&f, loop_splits);
+        const slinky::func* root =
+            global_loop_nest[loop_nest.back()].loop_id.func;
+        const auto* root_sched =
+            root ? static_cast<const ynn::scheduling_info*>(root->user_data())
+                 : nullptr;
+        const slinky::index_t root_row_bytes =
+            root_sched ? row_bytes_of(root, root_sched->loop_splits) : 0;
+        const slinky::index_t contiguous_run_bytes = [&]() -> slinky::index_t {
+          for (const ynn::scheduling_split& s : loop_splits) {
+            if (s.var == f.outputs()[0].dims[0]) {
+              std::optional<slinky::index_t> ub =
+                  slinky::evaluate_constant_upper_bound(s.extent);
+              return ub ? *ub * *elem : 0;
+            }
+          }
+          return 0;
+        }();
+        // The non-constant (batch) splits must match an outer prefix of the
+        // nest.
+        std::vector<bool> matched = split_matched;
+        std::vector<int> prefix;
         int num_symbolic = 0;
-        slinky::index_t row_bytes = *elem;
-        for (int i = 0; i < static_cast<int>(loop_splits.size()); ++i) {
-          const ynn::scheduling_split& s = loop_splits[i];
-          if (!globals.is_pure_dim(s.var)) continue;
-          std::optional<slinky::index_t> ub =
-              slinky::evaluate_constant_upper_bound(s.extent);
-          if (!ub) {
-            is_symbolic[i] = true;
+        for (const ynn::scheduling_split& s : loop_splits) {
+          if (globals.is_pure_dim(s.var) &&
+              !slinky::evaluate_constant_upper_bound(s.extent)) {
             ++num_symbolic;
-          } else {
-            row_bytes =
-                slinky::mul_sat(row_bytes, std::max<slinky::index_t>(*ub, 1));
           }
         }
-        const bool wide_reduction_input =
-            row_bytes >=
-            slinky::mul_sat(static_cast<slinky::index_t>(2 * max_threads),
-                            root_row_bytes);
-        std::vector<bool> matched = split_matched;
-        std::vector<int> prefix;  // loop_nest indices, outermost first
-        int last_symbolic_loop = -1;
         for (size_t i = 0; i < loop_nest.size() && num_symbolic > 0; ++i) {
           loop_level& l = global_loop_nest[loop_nest[i]];
-          const bool is_pr = [&]() {
-            std::optional<slinky::var> v = slinky::as_variable(l.step);
-            return v && globals.symbols.name(*v).rfind("pr_split", 0) == 0;
-          }();
-          if (l.step_is_required || is_pr) break;
+          std::optional<slinky::var> v = slinky::as_variable(l.step);
+          if (l.step_is_required ||
+              (v && globals.symbols.name(*v).rfind("pr_split", 0) == 0)) {
+            break;
+          }
           auto [consumer_buf, consumer_dim] =
               find_output_dim(l.loop_id.func, l.loop_id.var);
           const int region =
@@ -1160,45 +1124,58 @@ void ynn_runtime::schedule() {
                   : -1;
           const int m = find_matching_split(globals, f, loop_splits, matched,
                                             region, source_regions);
-          if (m == -1 || !is_symbolic[m]) break;
+          if (m == -1 ||
+              slinky::evaluate_constant_upper_bound(loop_splits[m].extent)) {
+            break;
+          }
           matched[m] = true;
           prefix.push_back(static_cast<int>(i));
-          last_symbolic_loop = static_cast<int>(i);
           --num_symbolic;
         }
         const slinky::index_t tile = unfuse_batch_tile();
         const slinky::index_t tile_bytes =
             slinky::mul_sat(row_bytes, prefix.empty() ? 1 : tile);
-        if (wide_reduction_input && num_symbolic == 0 &&
+        if (getenv("YNN_UNFUSE_DEBUG")) {
+          fprintf(stderr,
+                  "unfuse? %s row=%lld root_row=%lld run=%lld sym_left=%d "
+                  "prefix=%zu\n",
+                  tuner_func_name(globals, &f).c_str(), (long long)row_bytes,
+                  (long long)root_row_bytes,
+                  (long long)contiguous_run_bytes, num_symbolic,
+                  prefix.size());
+        }
+        if (num_symbolic == 0 && root_row_bytes > 0 &&
+            row_bytes >= slinky::mul_sat(
+                             static_cast<slinky::index_t>(2 * max_threads),
+                             root_row_bytes) &&
+            contiguous_run_bytes >= 512 &&
             tile_bytes <= unfuse_bytes_budget()) {
           rule_max_compute_at = static_cast<int>(prefix.size());
-          // Constant pinned tiles on the fused batch loops: the innermost
-          // gets the batch tile, outer ones step by 1. Pinned steps survive
-          // reconciliation (see loop_level::step_pinned).
+          // Pin constant steps on the fused batch loops (see step_pinned):
+          // the innermost gets the batch tile, outer ones step by 1.
           for (int i : prefix) {
             loop_level& l = global_loop_nest[loop_nest[i]];
-            const slinky::index_t step = i == last_symbolic_loop ? tile : 1;
+            const slinky::index_t step = i == prefix.back() ? tile : 1;
             l.step = align_step(slinky::expr(step), l.step_alignment);
             l.proposed_step = slinky::expr();
             l.step_is_required = true;
             l.step_pinned = true;
           }
-          // Realize this function's own parallelism: constant-extent pure
-          // splits that made no real splitting decision get a constant step
-          // sized for the thread pool.
+          // Give f's whole-extent constant splits real steps.
           for (ynn::scheduling_split& s : loop_splits) {
             std::optional<slinky::index_t> ub =
                 slinky::evaluate_constant_upper_bound(s.extent);
-            if (!ub || *ub < 2) continue;
-            if (iterations_lower_bound(globals, s.extent, s.step) > 1) {
+            if (!ub || *ub < 2 ||
+                iterations_lower_bound(globals, s.extent, s.step) > 1) {
               continue;
             }
-            const slinky::index_t step = std::max<slinky::index_t>(
-                slinky::ceil_div<slinky::index_t>(*ub, 4 * max_threads), 1);
-            s.step = align_step(slinky::expr(step), s.step_alignment);
+            s.step = align_step(
+                slinky::expr(std::max<slinky::index_t>(
+                    slinky::ceil_div<slinky::index_t>(*ub, 4 * max_threads),
+                    1)),
+                s.step_alignment);
           }
-          // Tile the consumer's remaining single-tile pure loops so the
-          // reduction phase parallelizes too.
+          // Tile the remaining nest loops for the reduction phase.
           for (size_t i = prefix.size(); i < loop_nest.size(); ++i) {
             loop_level& l = global_loop_nest[loop_nest[i]];
             if (!globals.is_pure_dim(l.loop_id.var) || l.step_is_required ||
