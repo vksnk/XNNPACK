@@ -457,6 +457,43 @@ slinky::index_t unfuse_bytes_budget() {
   return budget;
 }
 
+// The un-fuse decision as a comparison of time estimates rather than
+// thresholds. Named hardware parameters (not fitted cutoffs):
+//   kBwBytesPerNs: per-core effective stream bandwidth;
+//   kSyncNs: wall cost of the extra parallel phases (sync/wakeup);
+//   kMemLatencyNs: cost of an isolated access -- a re-read whose contiguous
+//     runs are short cannot stream and pays latency per run, so its
+//     effective bandwidth is run_bytes / latency.
+// Fused, the candidate's traffic is serialized on its nest's `tasks`.
+// Un-fused, it runs on all threads, its output is re-read once by the
+// (refined) reduction phase, and we pay one extra sync. The former
+// threshold gates fall out of the estimates: the ~16KB/thread work floor is
+// where kSyncNs beats the recovered time; small reduction factors (e.g.
+// 256-wide blocks) never accumulate enough serialized traffic to pay it
+// either; the contiguous-run gate is the latency-bound re-read. The cache
+// budget stays a hard bound elsewhere: past it the round-trip is DRAM and
+// the cache-resident re-read estimate does not hold.
+bool unfuse_pays(slinky::index_t row_bytes, slinky::index_t in_bytes,
+                 slinky::index_t run_bytes, slinky::index_t tasks,
+                 int max_threads) {
+  constexpr double kBwBytesPerNs = 30.0;
+  constexpr double kSyncNs = 3000.0;
+  constexpr double kMemLatencyNs = 100.0;
+  if (run_bytes <= 0) return false;
+  const double p =
+      static_cast<double>(std::max<slinky::index_t>(tasks, 1));
+  const double threads = static_cast<double>(max_threads);
+  const double traffic = static_cast<double>(row_bytes + in_bytes);
+  const double bw_reread = std::min(
+      kBwBytesPerNs, static_cast<double>(run_bytes) / kMemLatencyNs);
+  const double t_fused = traffic / (kBwBytesPerNs * p);
+  const double t_unfused = traffic / (kBwBytesPerNs * threads) +
+                           static_cast<double>(row_bytes) /
+                               (bw_reread * threads) +
+                           kSyncNs;
+  return t_unfused < t_fused;
+}
+
 // The constant batch-tile step used by the symbolic-batch arm of the un-fuse
 // rule (YNN_UNFUSE_TILE to override).
 slinky::index_t unfuse_batch_tile() {
@@ -917,6 +954,41 @@ void ynn_runtime::schedule() {
     }
   }
 
+  // The fusion walk below reverses each function's loop_splits in place and
+  // edits their steps, so running it twice needs the declared splits saved.
+  // Two passes let the un-fuse rule decide from the FINISHED schedule: the
+  // walk's incremental task bound cannot see a nest that a later-fused
+  // producer's required splits will retile (its step shrinks to the kernel
+  // block, multiplying the tasks), so pass 1 runs with the rule off, the
+  // rule then judges each recorded candidate against its final nest, and
+  // pass 2 re-runs the walk applying those decisions. The tuner keeps the
+  // single-pass behavior: its stateful decision stream must be consumed
+  // exactly once.
+  struct unfuse_candidate {
+    int func;
+    slinky::index_t row_bytes;
+    slinky::index_t in_bytes;
+    slinky::index_t run_bytes;
+  };
+  std::vector<unfuse_candidate> unfuse_candidates;
+  std::set<int> unfuse_decisions;
+  const bool unfuse_two_pass =
+      unfuse_rule_enabled() && !tuner && max_threads > 1;
+  int unfuse_pass = 0;  // 0: single pass; 1: analysis; 2: apply decisions.
+  std::vector<std::vector<ynn::scheduling_split>> saved_splits;
+  if (unfuse_two_pass) {
+    saved_splits.resize(funcs.size());
+    for (size_t i = 0; i < funcs.size(); ++i) {
+      if (auto* s = static_cast<ynn::scheduling_info*>(funcs[i].user_data())) {
+        saved_splits[i] = s->loop_splits;
+      }
+    }
+  }
+
+  auto run_walk = [&]() {
+  consumers.clear();
+  global_loop_nest.clear();
+  func_scheduling_data.assign(funcs.size(), {});
   for (int i = funcs.size() - 1; i >= 0; --i) {
     slinky::func& f = funcs[i];
     scheduling_data& sched_data = func_scheduling_data[i];
@@ -1110,18 +1182,13 @@ void ynn_runtime::schedule() {
         return b;
       };
       int rule_max_compute_at = static_cast<int>(loop_nest.size());
+      const slinky::index_t nest_tasks =
+          !loop_nest.empty()
+              ? nest_tasks_lower_bound(globals, global_loop_nest, loop_nest)
+              : 0;
       if (unfuse_rule_enabled() && max_threads > 1 && !loop_nest.empty() &&
-          pure_elementwise && elem &&
-          nest_tasks_lower_bound(globals, global_loop_nest, loop_nest) <
-              max_threads) {
+          pure_elementwise && elem && nest_tasks < max_threads) {
         const slinky::index_t row_bytes = row_bytes_of(&f, loop_splits);
-        const slinky::func* root =
-            global_loop_nest[loop_nest.back()].loop_id.func;
-        const auto* root_sched =
-            root ? static_cast<const ynn::scheduling_info*>(root->user_data())
-                 : nullptr;
-        const slinky::index_t root_row_bytes =
-            root_sched ? row_bytes_of(root, root_sched->loop_splits) : 0;
         const slinky::index_t contiguous_run_bytes = [&]() -> slinky::index_t {
           for (const ynn::scheduling_split& s : loop_splits) {
             if (s.var == f.outputs()[0].dims[0]) {
@@ -1170,26 +1237,50 @@ void ynn_runtime::schedule() {
         const slinky::index_t tile = unfuse_batch_tile();
         const slinky::index_t tile_bytes =
             slinky::mul_sat(row_bytes, prefix.empty() ? 1 : tile);
+        // Bytes f reads per tile: each input's element size times its
+        // provably-constant extents. Unprovable or broadcast dims count as 1,
+        // which under-counts traffic and therefore biases against firing.
+        slinky::index_t in_bytes = 0;
+        for (const slinky::func::input& in : f.inputs()) {
+          std::optional<slinky::index_t> e =
+              slinky::as_constant(in.buffer->elem_size());
+          if (!e) continue;
+          slinky::index_t b = *e;
+          for (std::size_t d = 0; d < in.buffer->rank(); ++d) {
+            std::optional<slinky::index_t> ub =
+                slinky::evaluate_constant_upper_bound(
+                    in.buffer->dim(d).extent());
+            if (ub && *ub > 1) b = slinky::mul_sat(b, *ub);
+          }
+          in_bytes += b;
+        }
         if (getenv("YNN_UNFUSE_DEBUG")) {
           fprintf(stderr,
-                  "unfuse? %s row=%lld root_row=%lld run=%lld sym_left=%d "
-                  "prefix=%zu\n",
+                  "unfuse? %s row=%lld in=%lld run=%lld tasks=%lld "
+                  "sym_left=%d prefix=%zu\n",
                   tuner_func_name(globals, &f).c_str(), (long long)row_bytes,
-                  (long long)root_row_bytes,
-                  (long long)contiguous_run_bytes, num_symbolic,
-                  prefix.size());
+                  (long long)in_bytes, (long long)contiguous_run_bytes,
+                  (long long)nest_tasks, num_symbolic, prefix.size());
         }
-        if (num_symbolic == 0 && root_row_bytes > 0 &&
-            row_bytes >= slinky::mul_sat(
-                             static_cast<slinky::index_t>(2 * max_threads),
-                             root_row_bytes) &&
-            // Firing costs a fixed ~10-15us of sync/wakeup CPU across the
-            // extra phases; at ~16KB of intermediate per thread the recovered
-            // serial work only breaks even on wall time while roughly
-            // doubling CPU (measured), so require strictly more than that.
-            row_bytes > static_cast<slinky::index_t>(16384) * max_threads &&
-            contiguous_run_bytes >= 512 &&
-            tile_bytes <= unfuse_bytes_budget()) {
+        bool fire = false;
+        if (num_symbolic == 0 && tile_bytes <= unfuse_bytes_budget()) {
+          if (unfuse_pass == 1) {
+            // Analysis pass: only record fully-static candidates; the
+            // decision uses the finished schedule's exact task count.
+            if (prefix.empty()) {
+              unfuse_candidates.push_back(
+                  {i, row_bytes, in_bytes, contiguous_run_bytes});
+            }
+          } else if (unfuse_pass == 2 && prefix.empty()) {
+            fire = unfuse_decisions.count(i) > 0;
+          } else {
+            // Single-pass (tuner) and symbolic-batch candidates decide
+            // inline with the (possibly conservative) current nest bound.
+            fire = unfuse_pays(row_bytes, in_bytes, contiguous_run_bytes,
+                               nest_tasks, max_threads);
+          }
+        }
+        if (fire) {
           rule_max_compute_at = static_cast<int>(prefix.size());
           // Pin constant steps on the fused batch loops (see step_pinned):
           // the innermost gets the batch tile, outer ones step by 1.
@@ -1314,6 +1405,41 @@ void ynn_runtime::schedule() {
     for (const auto& input : f.inputs()) {
       consumers[input.buffer->sym()].push_back(i);
     }
+  }
+  };  // run_walk
+
+  if (unfuse_two_pass) {
+    unfuse_pass = 1;
+    run_walk();
+    for (const unfuse_candidate& c : unfuse_candidates) {
+      const std::vector<int>& nest = func_scheduling_data[c.func].loop_nest;
+      const slinky::index_t final_tasks =
+          nest.empty() ? 0
+                       : nest_tasks_lower_bound(globals, global_loop_nest,
+                                                nest);
+      const bool fire =
+          final_tasks < max_threads &&
+          unfuse_pays(c.row_bytes, c.in_bytes, c.run_bytes, final_tasks,
+                      max_threads);
+      if (fire) unfuse_decisions.insert(c.func);
+      if (getenv("YNN_UNFUSE_DEBUG")) {
+        fprintf(stderr, "unfuse! %s row=%lld in=%lld run=%lld "
+                        "final_tasks=%lld -> %s\n",
+                tuner_func_name(globals, &funcs[c.func]).c_str(),
+                (long long)c.row_bytes, (long long)c.in_bytes,
+                (long long)c.run_bytes, (long long)final_tasks,
+                fire ? "FIRE" : "keep fused");
+      }
+    }
+    for (size_t i = 0; i < funcs.size(); ++i) {
+      if (auto* s = static_cast<ynn::scheduling_info*>(funcs[i].user_data())) {
+        s->loop_splits = saved_splits[i];
+      }
+    }
+    unfuse_pass = 2;
+    run_walk();
+  } else {
+    run_walk();
   }
 
   // A function executes inside every loop of its (final) loop nest, so the
