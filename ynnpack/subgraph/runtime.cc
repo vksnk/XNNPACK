@@ -1063,12 +1063,6 @@ extern "C" {
 ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
                          slinky::thread_pool* threadpool, uint32_t flags)
     : subgraph(subgraph), flags(flags), globals(subgraph->globals) {
-  // Implement our required alignment for heap allocations.
-  eval_config.allocate = [](slinky::var sym, slinky::raw_buffer* buffer) {
-    return buffer->allocate(YNN_ALLOCATION_ALIGNMENT);
-  };
-  eval_config.free = [](slinky::var sym, slinky::raw_buffer* buffer,
-                        void* ptr) { std::free(ptr); };
   eval_config.thread_pool = threadpool;
   // Slinky's default check failure handler calls std::abort(), don't let that
   // happen here.
@@ -1076,7 +1070,7 @@ ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
     YNN_LOG_ERROR() << "Check failed";
   };
   eval_config.call_failed = [](const slinky::call_stmt* c) {
-    YNN_LOG_ERROR() << c->attrs.name << " failed";
+    YNN_LOG_ERROR() << (c->attrs ? c->attrs->name : "<unnamed>") << " failed";
   };
   eval_config.base_alignment = YNN_ALLOCATION_ALIGNMENT;
   eval_config.auto_stack_threshold = auto_stack_threshold;
@@ -1294,8 +1288,12 @@ ynn_status ynn_runtime::invoke() {
     // This pipeline is a no-op.
     return ynn_status_success;
   }
-  return pipeline.evaluate(eval_context) ? ynn_status_error
-                                         : ynn_status_success;
+  slinky::index_t result = pipeline.evaluate(eval_context);
+  // Heap blocks are reused within an evaluation, but not kept between
+  // invokes: this runtime (and its eval_context) can be long-lived, and there
+  // is one per subgraph, so retained blocks would accumulate across the model.
+  eval_context.free_pool();
+  return result ? ynn_status_error : ynn_status_success;
 }
 
 ynn_status ynn_set_external_value_shape(ynn_runtime_t runtime,
