@@ -1413,6 +1413,10 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       require_contiguous(*packed_b.buffer, 1);
     }
     output.make_buffer(runtime);
+    // The kernels write rows of C densely; only the row stride is free. Without
+    // this, slinky may alias the output into a buffer with a different
+    // innermost dimension (e.g. a concatenation along another axis).
+    require_contiguous(*output.buffer, 1);
 
     std::vector<slinky::var> output_dims =
         runtime.globals.make_dims(output.rank());
