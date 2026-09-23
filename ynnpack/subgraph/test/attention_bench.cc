@@ -287,7 +287,7 @@ void AttentionSweepArguments(benchmark::Benchmark* b) {
   b->MeasureProcessCPUTime();
   for (int seq : {1024, 2048, 4096, 8192, 16384}) {
     for (int heads : {8, 32}) {
-      for (int threads : {1, 4}) {
+      for (int threads : {1, 2, 4, 8}) {
         for (int block : {0, 64, 128, 256, 512, 1024, 2048}) {
           if (block >= seq) continue;
           b->Args({seq, heads, threads, block, 0});
