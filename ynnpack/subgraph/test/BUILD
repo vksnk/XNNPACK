@@ -294,6 +294,7 @@ cc_test(
         "//ynnpack",
         "//ynnpack/base",
         "//ynnpack/composites",
+        "//ynnpack/subgraph",
     ] + ynn_benchmark_deps(),
 )
 

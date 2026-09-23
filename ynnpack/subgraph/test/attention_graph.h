@@ -62,6 +62,15 @@ ynn_status define_flash_attention(ynn_subgraph_t subgraph, uint32_t query_id,
                                   float scale, size_t block_width,
                                   uint32_t& output_id);
 
+// Same as `define_flash_attention`, but computes the transposed problem
+// (S^T = K @ Q^T, U^T = V^T @ P^T) so that t is the innermost dimension of
+// every per-block intermediate, and transposes the output back at the end.
+ynn_status define_flash_attention_transposed(ynn_subgraph_t subgraph,
+                                             uint32_t query_id, uint32_t key_id,
+                                             uint32_t value_id, float scale,
+                                             size_t block_width,
+                                             uint32_t& output_id);
+
 }  // namespace ynn
 
 #endif  // XNNPACK_YNNPACK_SUBGRAPH_TEST_ATTENTION_GRAPH_H_

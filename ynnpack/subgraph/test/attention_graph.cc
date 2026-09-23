@@ -266,4 +266,153 @@ ynn_status define_flash_attention(ynn_subgraph_t subgraph, uint32_t query_id,
                            global_sum_id, &output_id, 0);
 }
 
+ynn_status define_flash_attention_transposed(ynn_subgraph_t subgraph,
+                                             uint32_t query_id, uint32_t key_id,
+                                             uint32_t value_id, float scale,
+                                             size_t block_width,
+                                             uint32_t& output_id) {
+  if (block_width == 0) {
+    return ynn_status_invalid_parameter;
+  }
+
+  // ---- Pass 1: per-block map, with t as the innermost dimension ----
+  uint32_t scale_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(define_constant(subgraph, scale, scale_id));
+  uint32_t scaled_query_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_multiply,
+                                        query_id, scale_id, &scaled_query_id,
+                                        0));
+
+  // Q^T with a block axis: [b, n, t, h] -> [b, n, 1, h, t].
+  const int32_t q_t_perm[] = {0, 1, 3, 2};
+  uint32_t query_t_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_transpose(
+      subgraph, 4, q_t_perm, scaled_query_id, &query_t_id, 0));
+  const int32_t block_axis_of_5d[] = {-3};
+  uint32_t query_t_5d_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_expand_dims(
+      subgraph, 1, block_axis_of_5d, query_t_id, &query_t_5d_id, 0));
+
+  // [b, n, s, h] -> [b, n, s/w, w, h].
+  const size_t splits[] = {0, block_width};
+  uint32_t key_blocks_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_split_dim(subgraph, /*axis=*/-2, 2, splits,
+                                           key_id, &key_blocks_id, 0));
+  uint32_t value_blocks_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_split_dim(subgraph, /*axis=*/-2, 2, splits,
+                                           value_id, &value_blocks_id, 0));
+
+  // S_b^T = K_b @ Q^T: [b, n, s/w, w, t]. K_b is the `a` operand in its natural
+  // layout.
+  uint32_t scores_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_dot(subgraph, /*num_k_dims=*/1, key_blocks_id,
+                                     query_t_5d_id, YNN_INVALID_VALUE_ID,
+                                     &scores_id, 0));
+
+  // Block-local softmax statistics over the w axis (-2), which is not the
+  // innermost dimension, so these are vectorized over t.
+  const int32_t w_axis[] = {-2};
+  uint32_t block_max_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_reduce(subgraph, ynn_reduce_max, 1, w_axis,
+                                        scores_id, YNN_INVALID_VALUE_ID,
+                                        &block_max_id, YNN_NODE_FLAG_KEEP_DIMS));
+  uint32_t scores_minus_max_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_subtract,
+                                        scores_id, block_max_id,
+                                        &scores_minus_max_id, 0));
+  uint32_t probs_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_unary(subgraph, ynn_unary_exp,
+                                       scores_minus_max_id, &probs_id, 0));
+  uint32_t block_sum_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_reduce(subgraph, ynn_reduce_sum, 1, w_axis,
+                                        probs_id, YNN_INVALID_VALUE_ID,
+                                        &block_sum_id, YNN_NODE_FLAG_KEEP_DIMS));
+
+  // U_b^T = V_b^T @ P_b^T: [b, n, s/w, h, t].
+  const int32_t v_t_perm[] = {0, 1, 2, 4, 3};
+  uint32_t value_blocks_t_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_transpose(
+      subgraph, 5, v_t_perm, value_blocks_id, &value_blocks_t_id, 0));
+  uint32_t block_output_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_dot(subgraph, /*num_k_dims=*/1,
+                                     value_blocks_t_id, probs_id,
+                                     YNN_INVALID_VALUE_ID, &block_output_id,
+                                     0));
+
+  // Pack [m_b; l_b; U_b^T] along axis -2 into [b, n, s/w, h + 2, t]. Every
+  // piece has t innermost, so the packing and the slices below are dense.
+  const uint32_t pack_inputs[] = {block_max_id, block_sum_id, block_output_id};
+  uint32_t packed_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_concatenate(subgraph, /*axis=*/-2, 3,
+                                             pack_inputs, &packed_id, 0));
+
+  // ---- Pass 2: combine across blocks ----
+  const int32_t pack_axis[] = {-2};
+  const int64_t begins_m[] = {0}, ends_m[] = {1};
+  const int64_t begins_l[] = {1}, ends_l[] = {2};
+  const int64_t begins_u[] = {2}, ends_u[] = {0};
+  const int64_t strides[] = {1};
+  uint32_t sliced_max_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_slice(subgraph, 1, pack_axis, begins_m,
+                                              ends_m, strides, packed_id,
+                                              &sliced_max_id, 0));
+  uint32_t sliced_sum_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_slice(subgraph, 1, pack_axis, begins_l,
+                                              ends_l, strides, packed_id,
+                                              &sliced_sum_id, 0));
+  uint32_t local_output_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_static_slice(subgraph, 1, pack_axis, begins_u,
+                                              ends_u, strides, packed_id,
+                                              &local_output_id, 0));
+  // See define_flash_attention for why these broadcasts are needed.
+  uint32_t local_max_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_broadcast(subgraph, 1, pack_axis,
+                                           sliced_max_id, &local_max_id, 0));
+  uint32_t local_sum_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_broadcast(subgraph, 1, pack_axis,
+                                           sliced_sum_id, &local_sum_id, 0));
+
+  const int32_t block_axis[] = {-3};
+  uint32_t global_max_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_reduce(
+      subgraph, ynn_reduce_max, 1, block_axis, local_max_id,
+      YNN_INVALID_VALUE_ID, &global_max_id, YNN_NODE_FLAG_KEEP_DIMS));
+  uint32_t max_diff_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_subtract,
+                                        local_max_id, global_max_id,
+                                        &max_diff_id, 0));
+  uint32_t correction_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_unary(subgraph, ynn_unary_exp, max_diff_id,
+                                       &correction_id, 0));
+
+  // l = sum_b(c_b * l_b): [b, n, 1, t].
+  uint32_t scaled_sum_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_multiply,
+                                        local_sum_id, correction_id,
+                                        &scaled_sum_id, 0));
+  uint32_t global_sum_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_reduce(subgraph, ynn_reduce_sum, 1, block_axis,
+                                        scaled_sum_id, YNN_INVALID_VALUE_ID,
+                                        &global_sum_id, 0));
+
+  // O^T = sum_b(c_b * U_b^T) / l: [b, n, h, t].
+  uint32_t scaled_output_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_multiply,
+                                        local_output_id, correction_id,
+                                        &scaled_output_id, 0));
+  uint32_t numerator_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_reduce(subgraph, ynn_reduce_sum, 1, block_axis,
+                                        scaled_output_id, YNN_INVALID_VALUE_ID,
+                                        &numerator_id, 0));
+  uint32_t output_t_id = YNN_INVALID_VALUE_ID;
+  YNN_RETURN_IF_ERROR(ynn_define_binary(subgraph, ynn_binary_divide,
+                                        numerator_id, global_sum_id,
+                                        &output_t_id, 0));
+
+  // O = (O^T)^T: [b, n, t, h].
+  const int32_t o_perm[] = {0, 1, 3, 2};
+  return ynn_define_static_transpose(subgraph, 4, o_perm, output_t_id,
+                                     &output_id, 0);
+}
+
 }  // namespace ynn

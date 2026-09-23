@@ -4,20 +4,59 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "ynnpack/composites/util.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/runtime.h"
 #include "ynnpack/subgraph/test/attention_graph.h"
 #include "ynnpack/subgraph/test/scheduler.h"
 #include <benchmark/benchmark.h>
 
 namespace ynn {
 namespace {
+
+// Tracks the heap memory held by the runtime's scratch buffers.
+std::atomic<size_t> g_current_bytes{0};
+std::atomic<size_t> g_peak_bytes{0};
+std::mutex g_sizes_mutex;
+std::unordered_map<void*, size_t> g_sizes;
+
+void* TrackingAlloc(size_t alignment, size_t size) {
+  void* ptr = std::aligned_alloc(alignment, (size + alignment - 1) /
+                                                alignment * alignment);
+  if (!ptr) return nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_sizes_mutex);
+    g_sizes[ptr] = size;
+  }
+  const size_t current = g_current_bytes += size;
+  size_t peak = g_peak_bytes.load();
+  while (current > peak && !g_peak_bytes.compare_exchange_weak(peak, current)) {
+  }
+  return ptr;
+}
+
+void TrackingFree(void* ptr) {
+  if (!ptr) return;
+  size_t size;
+  {
+    std::lock_guard<std::mutex> lock(g_sizes_mutex);
+    auto it = g_sizes.find(ptr);
+    size = it->second;
+    g_sizes.erase(it);
+  }
+  g_current_bytes -= size;
+  std::free(ptr);
+}
 
 using threadpool_ptr =
     std::unique_ptr<ynn_threadpool, decltype(&ynn_delete_threadpool)>;
@@ -34,16 +73,13 @@ using threadpool_ptr =
 // `block_width` == 0 benchmarks the vanilla `define_attention` composite;
 // otherwise `define_flash_attention` (head-major I/O and the full KV sequence
 // only).
-void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
-                    bool transpose_io = false, bool decode1 = false,
-                    size_t block_width = 0) {
-  const bool dynamic = state.range(0);
-  const size_t s = state.range(1);
+void BenchAttentionImpl(benchmark::State& state, size_t b, size_t query_len,
+                        bool transpose_io, bool decode1, size_t block_width,
+                        bool dynamic, size_t s, size_t h, size_t n,
+                        int num_threads, int s_active,
+                        bool flash_transposed = false) {
   const size_t t = query_len == 0 ? s : query_len;
-  const size_t h = state.range(2);
-  const size_t n = state.range(3);
-  const int num_threads = static_cast<int>(state.range(4));
-  const int s_active = std::min<int>(s, static_cast<int>(state.range(5)));
+  s_active = std::min<int>(s, s_active);
   const float scale = 1.0f / std::sqrt(static_cast<float>(h));
   if (block_width != 0) {
     if (transpose_io || decode1 || s_active != s) {
@@ -120,7 +156,11 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
   }
 
   ynn_status status;
-  if (block_width != 0) {
+  if (block_width != 0 && flash_transposed) {
+    status = define_flash_attention_transposed(subgraph.get(), q_id,
+                                               actual_k_id, actual_v_id, scale,
+                                               block_width, actual_o_id);
+  } else if (block_width != 0) {
     status = define_flash_attention(subgraph.get(), q_id, actual_k_id,
                                     actual_v_id, scale, block_width,
                                     actual_o_id);
@@ -157,6 +197,9 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
     return;
   }
 
+  // Route the runtime's scratch allocations through the tracking allocator.
+  // The hook is read when the runtime is created.
+  ynn_set_buffer_allocator(TrackingAlloc, TrackingFree);
   runtime_ptr runtime = create_runtime(subgraph, threadpool.get(), 0);
   if (!runtime) {
     state.SkipWithError("failed to create runtime");
@@ -194,6 +237,7 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
     return;
   }
 
+  g_peak_bytes = g_current_bytes.load();
   for (auto _ : state) {
     if (ynn_invoke_runtime(runtime.get()) != ynn_status_success) {
       state.SkipWithError("failed to invoke runtime");
@@ -201,13 +245,58 @@ void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
     }
   }
 
+  // Peak bytes of heap scratch memory held by the runtime during an invoke
+  // (allocations below slinky's stack threshold are not included).
+  state.counters["peak_MB"] =
+      static_cast<double>(g_peak_bytes.load()) /
+      (1024.0 * 1024.0);
+
   const size_t flops = 2ull * b * n * t * s_active * h * 2;  // QK^T and P@V
   state.counters["FLOP"] =
       benchmark::Counter(static_cast<double>(state.iterations() * flops),
                          benchmark::Counter::kIsRate);
 }
 
+void BenchAttention(benchmark::State& state, size_t b, size_t query_len = 0,
+                    bool transpose_io = false, bool decode1 = false,
+                    size_t block_width = 0) {
+  BenchAttentionImpl(state, b, query_len, transpose_io, decode1, block_width,
+                     /*dynamic=*/state.range(0), /*s=*/state.range(1),
+                     /*h=*/state.range(2), /*n=*/state.range(3),
+                     /*num_threads=*/static_cast<int>(state.range(4)),
+                     /*s_active=*/static_cast<int>(state.range(5)));
+}
+
 void Attention(benchmark::State& state) { BenchAttention(state, /*b=*/1); }
+
+// Prefill over a range of sequence lengths, with the flash block width as an
+// argument (0 = vanilla attention).
+void AttentionSweep(benchmark::State& state) {
+  const size_t s = state.range(0);
+  BenchAttentionImpl(state, /*b=*/1, /*query_len=*/0, /*transpose_io=*/false,
+                     /*decode1=*/false, /*block_width=*/state.range(3),
+                     /*dynamic=*/false, s, /*h=*/64, /*n=*/state.range(1),
+                     /*num_threads=*/static_cast<int>(state.range(2)),
+                     /*s_active=*/static_cast<int>(s),
+                     /*flash_transposed=*/state.range(4));
+}
+
+void AttentionSweepArguments(benchmark::Benchmark* b) {
+  b->ArgNames({"seq", "heads", "threads", "block", "transposed"});
+  b->UseRealTime();
+  b->MeasureProcessCPUTime();
+  for (int seq : {1024, 2048, 4096, 8192, 16384}) {
+    for (int heads : {8, 32}) {
+      for (int threads : {1, 4}) {
+        for (int block : {0, 64, 128, 256, 512, 1024, 2048}) {
+          if (block >= seq) continue;
+          b->Args({seq, heads, threads, block, 0});
+          if (block != 0) b->Args({seq, heads, threads, block, 1});
+        }
+      }
+    }
+  }
+}
 
 // The best block width depends on the L3 size: the softmax chain makes
 // several passes over a seq x block_width score slab per block, so the slab
@@ -304,6 +393,9 @@ void AttentionArguments(benchmark::Benchmark* b) {
   }
 }
 
+BENCHMARK(AttentionSweep)
+    ->Apply(AttentionSweepArguments)
+    ->Unit(benchmark::TimeUnit::kMillisecond);
 BENCHMARK(Attention)
     ->Apply(AttentionArguments)
     ->Unit(benchmark::TimeUnit::kMillisecond);

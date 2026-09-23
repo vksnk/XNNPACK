@@ -136,7 +136,7 @@ std::vector<float> RunXnn(const Shape& sh, const std::vector<float>& q,
 std::vector<float> RunComposite(const Shape& sh, const std::vector<float>& q,
                                 const std::vector<float>& k,
                                 const std::vector<float>& v, float scale,
-                                size_t block_width) {
+                                size_t block_width, bool transposed = false) {
   const size_t b = sh.b, n = sh.n, t = sh.t, s = sh.s, h = sh.h;
   ynn::subgraph_ptr subgraph = ynn::create_subgraph(4, 0);
   if (!subgraph) abort();
@@ -157,6 +157,9 @@ std::vector<float> RunComposite(const Shape& sh, const std::vector<float>& q,
   if (block_width == 0) {
     status = ynn::define_attention(subgraph.get(), q_id, k_id, v_id, scale,
                                    o_id);
+  } else if (transposed) {
+    status = ynn::define_flash_attention_transposed(
+        subgraph.get(), q_id, k_id, v_id, scale, block_width, o_id);
   } else {
     status = ynn::define_flash_attention(subgraph.get(), q_id, k_id, v_id,
                                          scale, block_width, o_id);
@@ -243,6 +246,9 @@ int main() {
     ok &= Compare(sh, "attention", RunComposite(sh, q, k, v, scale, 0), ref);
     ok &= Compare(sh, "flash_attention",
                   RunComposite(sh, q, k, v, scale, sh.w), ref);
+    ok &= Compare(sh, "flash_attention_t",
+                  RunComposite(sh, q, k, v, scale, sh.w, /*transposed=*/true),
+                  ref);
   }
   printf(ok ? "PASS\n" : "FAIL\n");
   return ok ? 0 : 1;
