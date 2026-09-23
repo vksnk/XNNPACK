@@ -68,6 +68,10 @@ auto make_unary_elementwise_impl(unary_kernel_fn kernel, unary_params params,
 auto make_binary_elementwise_impl(binary_kernel_fn kernel) {
   return [kernel](slinky::raw_buffer a, slinky::raw_buffer b,
                   slinky::raw_buffer x) -> slinky::index_t {
+    slinky::dim a_storage[max_tensor_rank], b_storage[max_tensor_rank];
+    make_broadcasts_explicit(x, a, a_storage);
+    make_broadcasts_explicit(x, b, b_storage);
+
     slinky::dim a_dims[2], b_dims[2], x_dims[2];
 
     if (!fuse_and_slice_leading_dims<2>(&x_dims[0], x, &a_dims[0], a,
@@ -97,6 +101,12 @@ auto make_ternary_elementwise_impl(ternary_kernel_fn kernel) {
   return
       [kernel](slinky::raw_buffer a, slinky::raw_buffer b, slinky::raw_buffer c,
                slinky::raw_buffer x) -> slinky::index_t {
+        slinky::dim a_storage[max_tensor_rank], b_storage[max_tensor_rank],
+            c_storage[max_tensor_rank];
+        make_broadcasts_explicit(x, a, a_storage);
+        make_broadcasts_explicit(x, b, b_storage);
+        make_broadcasts_explicit(x, c, c_storage);
+
         slinky::dim a_dims[2], b_dims[2], c_dims[2], x_dims[2];
 
         if (!fuse_and_slice_leading_dims<2>(&x_dims[0], x, &a_dims[0], a,

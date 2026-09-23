@@ -11,6 +11,7 @@
 #ifndef XNNPACK_YNNPACK_SUBGRAPH_SLINKY_H_
 #define XNNPACK_YNNPACK_SUBGRAPH_SLINKY_H_
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <limits>
@@ -314,6 +315,34 @@ YNN_NO_INLINE void fuse_and_slice_leading_dims(int i, slinky::dim* x_dims,
 }
 
 }  // namespace internal
+
+// Elementwise kernels broadcast an input along a dimension by reading it with
+// a stride of 0, but the producer of the input only needs to provide the one
+// element the consumer depends on: it may be stored with a non-zero stride
+// (e.g. when slinky aliases it into a larger buffer). This replaces the
+// dimensions of `in` that have extent 1 but don't contain the corresponding
+// dimension of `x` with broadcasts, using `storage` for the modified
+// dimensions if necessary (the dimensions of `in` itself are not modified).
+template <std::size_t N>
+void make_broadcasts_explicit(const slinky::raw_buffer& x,
+                              slinky::raw_buffer& in,
+                              slinky::dim (&storage)[N]) {
+  const std::size_t rank = std::min(in.rank, x.rank);
+  bool copied = false;
+  for (std::size_t d = 0; d < rank; ++d) {
+    const slinky::dim& in_d = in.dim(d);
+    if (in_d.stride() == 0 || in_d.extent() != 1 || in_d.contains(x.dim(d))) {
+      continue;
+    }
+    if (!copied) {
+      assert(in.rank <= N);
+      std::copy(in.dims, in.dims + in.rank, storage);
+      in.dims = storage;
+      copied = true;
+    }
+    storage[d] = slinky::dim::broadcast();
+  }
+}
 
 // Peels off the innermost `NumInnerDims` dimensions of `x` and `inputs`,
 // and where possible, fuses dimensions of buffers from the innermost to the
