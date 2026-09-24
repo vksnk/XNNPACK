@@ -228,6 +228,8 @@ int main() {
       {2, 3, 17, 32, 8, 16},
       {1, 4, 64, 64, 32, 32},
       {1, 2, 100, 256, 64, 64},
+      // Long enough for the probs @ V dot to split its k (keys) dimension.
+      {1, 2, 64, 8192, 64, 256},
   };
 
   bool ok = true;
