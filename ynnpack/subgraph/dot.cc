@@ -738,6 +738,7 @@ uint32_t define_pack_b(ynn_subgraph& subgraph, const dot_type& type,
     auto sched =
         runtime.make_schedule(dims, output.physical_extents(),
                               output.buffer->elem_size(), given_splits);
+    sched->is_layout_transform = true;
     sched->loop_splits[0].step_is_required = true;
     sched->loop_splits[1].step_is_required = true;
 
@@ -902,6 +903,11 @@ void define_transpose_a(ynn_subgraph& subgraph, ynn_node& node, index_t tile_m,
     auto func = slinky::func::make(make_transpose_a_impl(m_dim),
                                    {std::move(func_input)},
                                    {{output.buffer, dims}}, std::move(attrs));
+
+    auto sched = std::make_unique<ynn::scheduling_info>();
+    sched->is_layout_transform = true;
+    func.user_data() = sched.get();
+    runtime.scheduling_info_storage.push_back(std::move(sched));
 
     runtime.funcs.push_back(std::move(func));
     return ynn_status_success;

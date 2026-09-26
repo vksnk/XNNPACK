@@ -631,6 +631,87 @@ std::vector<bool> initial_split_matches(
   return matched;
 }
 
+// Look through layout conversions to find the computation supplying an input.
+const slinky::func* compute_producer(
+    const slinky::buffer_expr_ptr& buffer,
+    const std::set<slinky::var>& external_output_syms) {
+  const slinky::func* producer = buffer->producer();
+  while (producer) {
+    const auto* sched =
+        static_cast<const ynn::scheduling_info*>(producer->user_data());
+    const bool layout = (sched && sched->is_layout_transform) ||
+                        (!producer->impl() && !producer->is_padded_copy());
+    if (!layout || producer->inputs().size() != 1 ||
+        (sched && sched->force_root) ||
+        produces_external_output(*producer, external_output_syms)) {
+      break;
+    }
+    producer = producer->inputs()[0].buffer->producer();
+  }
+  return producer;
+}
+
+// Prefer loops that stream the only computed input. Other inputs may need
+// larger buffers; this is a fusion preference, not a memory cost comparison.
+void prefer_producer_loops(
+    ynn::slinky_globals& globals, const slinky::func& f,
+    const source_region_map& source_regions,
+    const std::set<slinky::var>& external_output_syms,
+    const std::vector<loop_level>& global_loop_nest,
+    const std::vector<int>& loop_nest,
+    std::vector<ynn::scheduling_split>& splits,
+    const std::vector<bool>& split_matched) {
+  const slinky::func* producer = nullptr;
+  for (const auto& input : f.inputs()) {
+    const slinky::func* p = compute_producer(input.buffer, external_output_syms);
+    if (!p) continue;
+    if (producer && producer != p) return;
+    producer = p;
+  }
+  if (!producer || produces_external_output(*producer, external_output_syms)) {
+    return;
+  }
+  const auto* sched =
+      static_cast<const ynn::scheduling_info*>(producer->user_data());
+  if (!sched || sched->force_root || sched->loop_splits.empty()) return;
+
+  // Upstream splits are still innermost first. Match the shared prefix before
+  // considering this function's own loops.
+  std::vector<ynn::scheduling_split> producer_splits(
+      sched->loop_splits.rbegin(), sched->loop_splits.rend());
+  std::vector<bool> matched = initial_split_matches(globals, producer_splits);
+  auto match = [&](int region) {
+    const int split = find_matching_split(globals, *producer, producer_splits,
+                                         matched, region, source_regions);
+    if (split == -1) return false;
+    matched[split] = true;
+    return true;
+  };
+  for (int level : loop_nest) {
+    if (!match(loop_source_region(global_loop_nest[level].loop_id,
+                                  source_regions))) {
+      return;
+    }
+  }
+
+  std::vector<ynn::scheduling_split> preferred, remaining;
+  for (int i = 0; i < splits.size(); ++i) {
+    if (split_matched[i]) continue;
+    const auto& split = splits[i];
+    if (globals.is_pure_dim(split.var) &&
+        match(loop_source_region({&f, split.var}, source_regions))) {
+      preferred.push_back(split);
+    } else {
+      remaining.push_back(split);
+    }
+  }
+  preferred.insert(preferred.end(), remaining.begin(), remaining.end());
+  int next = 0;
+  for (int i = 0; i < splits.size(); ++i) {
+    if (!split_matched[i]) splits[i] = preferred[next++];
+  }
+}
+
 // Decide the step of a loop now shared by its owner and `split`. Each side
 // makes a claim on the step, and the stronger claim wins:
 //
@@ -858,6 +939,12 @@ void ynn_runtime::schedule() {
     }
 
     sched_data.compute_at = compute_at;
+
+    if (sched && !sched->is_layout_transform && !sched->loop_splits.empty()) {
+      prefer_producer_loops(globals, f, source_regions, external_output_syms,
+                            global_loop_nest, loop_nest, sched->loop_splits,
+                            sched_data.split_matched);
+    }
 
     // NOTE: potentially we could also track how much specific loop are
     // computing by keeping a sum of compute amounts for each of the functions

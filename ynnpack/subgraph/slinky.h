@@ -179,6 +179,8 @@ struct scheduling_info {
   // fused with loops derived from it.
   std::vector<std::vector<slinky::interval_expr>> input_scheduler_bounds;
 
+  // A single-input layout conversion, without arithmetic on the elements.
+  bool is_layout_transform = false;
   bool force_root = false;
 };
 

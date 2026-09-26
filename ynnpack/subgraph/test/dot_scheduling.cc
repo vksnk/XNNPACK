@@ -31,7 +31,8 @@ bool contains(const std::string& str, const std::string& substr) {
 template <typename AT, typename BT>
 void VerifyDotLoopOrder(const std::vector<size_t>& a_shape,
                         const std::vector<size_t>& b_shape,
-                        bool expect_split_k) {
+                        bool expect_split_k, bool computed_a = false,
+                        bool computed_b = false) {
   const uint32_t a_id = 0;
   const uint32_t b_id = 1;
   const uint32_t out_id = 2;
@@ -39,8 +40,19 @@ void VerifyDotLoopOrder(const std::vector<size_t>& a_shape,
   builder.AddInput(type_of<AT>(), a_shape, a_id)
       .AddInput(type_of<BT>(), b_shape, b_id)
       .AddOutput(type_of<float>(), TensorShape({a_shape[0], b_shape[1]}),
-                 out_id)
-      .AddDot(1, a_id, b_id, YNN_INVALID_VALUE_ID, out_id);
+                 out_id);
+  uint32_t dot_a = a_id, dot_b = b_id;
+  if (computed_a) {
+    dot_a = YNN_INVALID_VALUE_ID;
+    builder.AddTensor(type_of<AT>(), a_shape, dot_a)
+        .AddUnary(ynn_unary_abs, a_id, dot_a);
+  }
+  if (computed_b) {
+    dot_b = YNN_INVALID_VALUE_ID;
+    builder.AddTensor(type_of<BT>(), b_shape, dot_b)
+        .AddUnary(ynn_unary_abs, b_id, dot_b);
+  }
+  builder.AddDot(1, dot_a, dot_b, YNN_INVALID_VALUE_ID, out_id);
 
   TestScheduler scheduler(3);
   Runtime runtime(builder.GetSubgraph(), &scheduler,
@@ -58,12 +70,21 @@ void VerifyDotLoopOrder(const std::vector<size_t>& a_shape,
   Tensor<AT> a(a_shape);
   Tensor<BT> b(b_shape);
   Tensor<float> out({a_shape[0], b_shape[1]});
+  a.fill(AT(-1.0f));
+  b.fill(BT(-2.0f));
   runtime.ReshapeExternalTensor(a.extents(), a.data(), a_id)
       .ReshapeExternalTensor(b.extents(), b.data(), b_id)
       .ReshapeRuntime()
       .SetupExternalTensor(out.data(), out_id)
       .InvokeRuntime();
   EXPECT_EQ(runtime.Status(), ynn_status_success);
+
+  const float expected = (computed_a == computed_b ? 2.0f : -2.0f) * a_shape[1];
+  for (size_t i = 0; i < a_shape[0]; ++i) {
+    for (size_t j = 0; j < b_shape[1]; ++j) {
+      ASSERT_EQ(out({i, j}), expected) << i << " " << j;
+    }
+  }
 
   EXPECT_FALSE(trace_events.empty());
   EXPECT_EQ(trace_events.front(), "pipeline");
@@ -102,6 +123,19 @@ TEST(DotSchedulingTest, NarrowTypeNoSplitK) {
 
 TEST(DotSchedulingTest, NarrowTypeLargeSplitK) {
   VerifyDotLoopOrder<bfloat16, bfloat16>({300, 16384}, {16384, 400}, true);
+}
+
+// A computed input should stream by rows even when the dot splits K.
+TEST(DotSchedulingTest, ComputedAStreamsRows) {
+  VerifyDotLoopOrder<float, float>({300, 8192}, {8192, 400}, false, true);
+}
+
+TEST(DotSchedulingTest, ComputedBStreamsColumns) {
+  VerifyDotLoopOrder<float, float>({300, 8192}, {8192, 400}, false, false, true);
+}
+
+TEST(DotSchedulingTest, TwoComputedInputsPreserveSplitK) {
+  VerifyDotLoopOrder<float, float>({300, 8192}, {8192, 400}, true, true, true);
 }
 
 }  // namespace
