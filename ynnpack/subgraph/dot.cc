@@ -1626,13 +1626,18 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
     auto sched = runtime.make_schedule(
         all_dims, all_extents, output.buffer->elem_size(), splits, loop_order);
 
-    // We want to use exactly these loop splits for two innermost dot loops.
+    // Preserve the dot's tile preferences over ordinary split proposals.
+    // Shared tiles must start on packing boundaries for transposed A and
+    // packed B. Unpacked rows and columns can start anywhere.
+    const std::array<slinky::expr, 2> alignments = {
+        pack_b ? block_n : 1, transpose_a ? tile_m : 1};
     for (size_t dim_idx = 0; dim_idx < std::min<size_t>(output_dims.size(), 2);
          ++dim_idx) {
       slinky::var sym = output_dims[dim_idx];
       for (size_t i = 0; i < sched->loop_splits.size(); ++i) {
         if (sched->loop_splits[i].var == sym) {
           sched->loop_splits[i].step_is_required = true;
+          sched->loop_splits[i].required_alignment = alignments[dim_idx];
           break;
         }
       }

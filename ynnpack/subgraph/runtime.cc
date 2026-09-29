@@ -123,6 +123,7 @@ struct loop_level {
   slinky::expr extent;
   slinky::expr step;
   bool step_is_required = false;
+  slinky::expr required_alignment;
   // The index of the parent loop in the global loop nest, or -1 for the
   // outermost loops. Loops are appended after their parent, so the parent
   // index is always less than the index of the loop itself.
@@ -186,12 +187,16 @@ std::pair<slinky::var, int> find_output_dim(const slinky::func* f,
 }
 
 // Least common multiple of two (possibly symbolic) loop steps, evaluated at
-// runtime. Used to reconcile two producers that require different tiles for a
-// shared loop: a multiple of both keeps the fused loop an integer number of
-// each producer's tile (and hence a multiple of each kernel's m/n block).
+// runtime. A shared loop must respect both functions' blocking alignments.
 // If the LCM overflows, it clamps at the max index_t value.
 slinky::expr lcm_sat(ynn::slinky_globals& globals, slinky::expr a,
                      slinky::expr b) {
+  if (slinky::prove_true(a == 1, globals.fact_bounds, globals.fact_alignment)) {
+    return b;
+  }
+  if (slinky::prove_true(b == 1, globals.fact_bounds, globals.fact_alignment)) {
+    return a;
+  }
   if (slinky::prove_true(a == b, globals.fact_bounds, globals.fact_alignment)) {
     return a;
   }
@@ -396,7 +401,10 @@ void compute_workers(ynn::slinky_globals& globals, int max_threads,
     std::optional<slinky::index_t> extent_lb =
         slinky::evaluate_constant_lower_bound(l.extent);
     std::optional<slinky::index_t> step_ub =
-        slinky::evaluate_constant_upper_bound(resolve_let_var(globals, l.step));
+        slinky::evaluate_constant_upper_bound(
+            slinky::bounds_of(resolve_let_var(globals, l.step),
+                              globals.fact_bounds, globals.fact_alignment)
+                .max);
     if (extent_lb && step_ub && *step_ub > 0) {
       return std::max<slinky::index_t>(slinky::ceil_div(*extent_lb, *step_ub),
                                        1);
@@ -715,11 +723,11 @@ void prefer_producer_loops(
 // Decide the step of a loop now shared by its owner and `split`. Each side
 // makes a claim on the step, and the stronger claim wins:
 //
-//   required + required : reconcile with the lcm, so the loop is an integer
-//                         number of *both* tiles (two producers can require
-//                         different tiles for a shared loop, e.g. the two
-//                         attention matmuls pick different query tiles).
-//   required + anything : the required step, which is a kernel's blocking.
+//   required + required : prefer the smaller tile, rounded up to a multiple
+//                         of both blocking requirements. Without a separate
+//                         alignment, this is the LCM of the required steps.
+//                         The full extent needs no rounding (one iteration).
+//   required + anything : keep the required split's preferred step.
 //   chosen   + no claim : propose the chosen step, see below.
 //   otherwise           : keep the loop's step. When both sides computed a
 //                         real split, each is only meaningful within its own
@@ -733,25 +741,40 @@ void reconcile_step(ynn::slinky_globals& globals, loop_level& loop,
                     const ynn::scheduling_split& split,
                     const std::vector<ynn::scheduling_split>& loop_splits) {
   if (split.step_is_required) {
-    if (loop.step_is_required &&
-        !prove_true(split.step == loop.step, globals.fact_bounds,
-                    globals.fact_alignment)) {
-      // If the LCM overflows, it clamps at max index_t (assuming no
-      // splitting).
-      loop.step = lcm_sat(globals, loop.step, split.step);
+    const auto step_var = slinky::as_variable(loop.step);
+    const bool partial_reduction =
+        step_var && globals.symbols.name(*step_var).rfind("pr_split", 0) == 0;
+    slinky::expr step = split.step;
+    const slinky::expr alignment = split.required_alignment.defined()
+                                       ? split.required_alignment
+                                       : split.step;
+    if (loop.step_is_required) {
+      loop.required_alignment = lcm_sat(
+          globals,
+          loop.required_alignment.defined() ? loop.required_alignment : loop.step,
+          alignment);
+      // Only tile starts need alignment; a final tile can end at the extent.
+      // Resolve pr_split before updating it to avoid a self-reference.
+      step = slinky::min(
+          slinky::max(loop.extent, 1),
+          slinky::align_up(
+              min(partial_reduction ? resolve_let_var(globals, loop.step)
+                                    : loop.step,
+                  step),
+              loop.required_alignment));
     } else {
-      if (std::optional<slinky::var> v = slinky::as_variable(loop.step)) {
-        // This is a special variable which defines partial reduction bounds,
-        // so we need to override to match the loop step.
-        if (globals.symbols.name(*v).rfind("pr_split", 0) == 0) {
-          globals.update_let(*v, split.step);
-        }
-      }
-      loop.step = split.step;
+      loop.required_alignment = alignment;
+    }
+    step = slinky::simplify(step, globals.fact_bounds, globals.fact_alignment);
+    if (partial_reduction) {
+      // Keep the variable so every required match also updates the partial
+      // reduction's bounds and accumulation chunk.
+      globals.update_let(*step_var, step);
+    } else {
+      loop.step = step;
     }
     loop.step_is_required = true;
-    // A required step is a kernel's blocking, so it outranks any step an
-    // earlier function proposed for this loop.
+    // Required splits outrank ordinary proposals for this loop.
     loop.proposed_step = slinky::expr();
     return;
   }
@@ -963,6 +986,7 @@ void ynn_runtime::schedule() {
                                     dim.extent,
                                     dim.step,
                                     dim.step_is_required,
+                                    dim.required_alignment,
                                     parent});
         loop_nest.push_back(global_loop_nest.size() - 1);
       }

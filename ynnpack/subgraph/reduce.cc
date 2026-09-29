@@ -308,6 +308,7 @@ slinky::raw_buffer_ptr make_reduce_identity(ynn_type type, int rank,
 // the promoting convert fuses into the reduction loops and reads the
 // packed stored input, so byte-derived floors must use its density, not
 // the promoted one.
+// These are tile-size preferences, not required_alignment constraints.
 std::vector<slinky::expr> compute_reduce_alignments(
     ynn_type stored_type, span<const slinky::expr> extents,
     const axes_set& k_dims) {
