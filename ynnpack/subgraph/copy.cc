@@ -173,6 +173,7 @@ slinky::func make_reshape(ynn_runtime& runtime,
   slinky::func result = slinky::func::make(std::move(fn), {std::move(input)},
                                            {std::move(output)}, attrs);
   auto sched = std::make_unique<scheduling_info>();
+  sched->is_layout_transform = true;
   sched->force_root = true;
   result.user_data() = sched.get();
   runtime.scheduling_info_storage.push_back(std::move(sched));

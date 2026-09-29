@@ -214,6 +214,7 @@ void define_static_transpose(ynn_subgraph& subgraph, ynn_node& node,
 
     slinky::func f;
     auto sched = std::make_unique<scheduling_info>();
+    sched->is_layout_transform = true;
     if (op.alias) {
       f = slinky::func::make_copy({input.buffer, std::move(bounds)},
                                   {output.buffer, output_dims});
